@@ -1,17 +1,16 @@
-
 import time
 import logging
 from bson import ObjectId
 from pymongo import MongoClient
 from ..base import MemoryProvider
 from dataclasses import dataclass
-from ..memory_type import MemoryType
+from ...enums.memory_type import MemoryType
 from ...memagent import MemAgentModel
-from ...persona.persona import Persona
-from ...persona.role_type import RoleType
+from ...long_term_memory.semantic.persona.persona import Persona
+from ...long_term_memory.semantic.persona.role_type import RoleType
 from typing import Dict, Any, Optional, List
 from pymongo.operations import SearchIndexModel
-from ...embeddings.openai import get_embedding, get_embedding_dimensions
+from ...embeddings import get_embedding, get_embedding_dimensions
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +18,7 @@ logger = logging.getLogger(__name__)
 class MongoDBConfig():
     """Configuration for the MongoDB provider."""
 
-    def __init__(self, uri: str, db_name: str = "memorizz"):
+    def __init__(self, uri: str, db_name: str = "memorizz", lazy_vector_indexes: bool = False, embedding_provider = None, embedding_config: Dict[str, Any] = None):
         """
         Initialize the MongoDB provider with configuration settings.
         
@@ -29,9 +28,24 @@ class MongoDBConfig():
             The MongoDB URI.
         db_name : str
             The database name.
+        lazy_vector_indexes : bool
+            If True, vector indexes are created only when needed (when vector operations are performed).
+            If False, vector indexes are created immediately during initialization (requires embedding configuration).
+            Default: False (maintains backward compatibility)
+        embedding_provider : str or EmbeddingManager, optional
+            Embedding provider to use. Can be:
+            - EmbeddingManager instance (explicit injection)
+            - String provider name ("openai", "ollama", "voyageai") 
+            - None (uses global embedding configuration)
+        embedding_config : Dict[str, Any], optional
+            Configuration for the embedding provider. Only used when embedding_provider is a string.
+            Example: {"model": "text-embedding-3-small", "dimensions": 512}
         """
         self.uri = uri
         self.db_name = db_name
+        self.lazy_vector_indexes = lazy_vector_indexes
+        self.embedding_provider = embedding_provider
+        self.embedding_config = embedding_config or {}
 
 
 class MongoDBProvider(MemoryProvider):
@@ -47,6 +61,8 @@ class MongoDBProvider(MemoryProvider):
             Configuration dictionary containing:
             - 'uri': MongoDB URI
             - 'db_name': Database name
+            - 'lazy_vector_indexes': Whether to defer vector index creation
+            - 'embedding_provider': Optional explicit embedding provider
         """
         self.config = config
         self.client = MongoClient(config.uri)
@@ -61,11 +77,121 @@ class MongoDBProvider(MemoryProvider):
         self.shared_memory_collection = self.db[MemoryType.SHARED_MEMORY.value]
         self.summaries_collection = self.db[MemoryType.SUMMARIES.value]
 
+        # Track which vector indexes have been created
+        self._vector_indexes_created = set()
+        
+        # Process embedding provider configuration
+        self._embedding_provider = self._setup_embedding_provider(config)
+
         # Create all memory stores in MongoDB.
         self._create_memory_stores()
 
-        # Create a vector index for each memory store in MongoDB.
-        self._create_vector_indexes_for_memory_stores()
+        # Create vector indexes immediately only if not using lazy initialization
+        if not config.lazy_vector_indexes:
+            try:
+                self._create_vector_indexes_for_memory_stores()
+            except Exception as e:
+                logger.warning(f"Failed to create vector indexes during initialization: {e}")
+                logger.info("Vector indexes will be created lazily when needed")
+                # Set lazy mode if immediate creation fails
+                self.config.lazy_vector_indexes = True
+
+    def _setup_embedding_provider(self, config: MongoDBConfig):
+        """
+        Setup the embedding provider based on configuration.
+        
+        Parameters:
+        -----------
+        config : MongoDBConfig
+            The MongoDB configuration
+            
+        Returns:
+        --------
+        EmbeddingManager or None
+            The configured embedding provider, or None to use global configuration
+        """
+        if config.embedding_provider is None:
+            # No explicit provider - will use global configuration
+            return None
+        elif isinstance(config.embedding_provider, str):
+            # String provider name - create EmbeddingManager
+            try:
+                from ...embeddings import EmbeddingManager
+                provider = EmbeddingManager(config.embedding_provider, config.embedding_config)
+                logger.info(f"Created embedding provider: {provider.get_provider_info()}")
+                return provider
+            except Exception as e:
+                logger.error(f"Failed to create embedding provider '{config.embedding_provider}': {e}")
+                raise
+        else:
+            # Assume it's already an EmbeddingManager instance
+            return config.embedding_provider
+
+    def _get_embedding_provider(self):
+        """
+        Get the embedding provider to use, with fallback logic.
+        
+        Returns:
+        --------
+        EmbeddingManager or function
+            The embedding provider to use
+        """
+        if self._embedding_provider is not None:
+            # Use explicitly provided embedding provider
+            return self._embedding_provider
+        else:
+            # Fall back to global embedding configuration
+            from ...embeddings import get_embedding_manager
+            return get_embedding_manager()
+    
+    def _get_embedding_dimensions_safe(self) -> int:
+        """
+        Safely get embedding dimensions with error handling.
+        
+        Returns:
+        --------
+        int
+            The embedding dimensions, or None if not available
+        """
+        try:
+            if self._embedding_provider is not None:
+                # Use explicit provider
+                return self._embedding_provider.get_dimensions()
+            else:
+                # Use global configuration
+                from ...embeddings import get_embedding_dimensions
+                return get_embedding_dimensions()
+        except Exception as e:
+            logger.error(f"Failed to get embedding dimensions: {e}")
+            raise RuntimeError(
+                "Cannot determine embedding dimensions. Please configure embeddings first using:\n"
+                "configure_embeddings('openai', {'model': 'text-embedding-3-small', 'dimensions': 512})\n"
+                "Or use lazy_vector_indexes=True to defer vector index creation."
+            )
+    
+    def _ensure_vector_index_for_collection(self, collection, collection_name: str, memory_store: bool = False):
+        """
+        Ensure vector index exists for a collection, creating it lazily if needed.
+        
+        Parameters:
+        -----------
+        collection : pymongo.Collection
+            The MongoDB collection
+        collection_name : str  
+            Name of the collection (for tracking)
+        memory_store : bool
+            Whether this is a memory store collection
+        """
+        index_key = f"{collection_name}_vector_index"
+        
+        if index_key not in self._vector_indexes_created:
+            try:
+                self._setup_vector_search_index(collection, "vector_index", memory_store)
+                self._vector_indexes_created.add(index_key)
+                logger.info(f"Created vector index for collection: {collection_name}")
+            except Exception as e:
+                logger.error(f"Failed to create vector index for {collection_name}: {e}")
+                raise
 
     def _create_memory_stores(self) -> None:
         """
@@ -190,7 +316,7 @@ class MongoDBProvider(MemoryProvider):
             result = collection.insert_one(data_copy)
             return str(result.inserted_id)
 
-    def retrieve_by_query(self, query: Dict[str, Any], memory_store_type: MemoryType, limit: int = 1) -> Optional[Dict[str, Any]]:
+    def retrieve_by_query(self, query: Dict[str, Any], memory_store_type: MemoryType, limit: int = 1, include_embedding: bool = False) -> Optional[Dict[str, Any]]:
         """
         Retrieve a document from MongoDB.
         
@@ -200,12 +326,17 @@ class MongoDBProvider(MemoryProvider):
             The query to use for retrieval.
         limit : int
             The maximum number of documents to return.
+        include_embedding : bool
+            Whether to include the embedding field in the results. Default is False for performance.
         
         Returns:
         --------
         Optional[Dict[str, Any]]
             The retrieved document, or None if not found.
         """
+        
+        # Define projection to exclude embeddings by default
+        projection = {} if include_embedding else {"embedding": 0}
         
         if memory_store_type == MemoryType.PERSONAS:
             return self.retrieve_persona_by_query(query, limit=limit)
@@ -214,11 +345,11 @@ class MongoDBProvider(MemoryProvider):
         elif memory_store_type == MemoryType.WORKFLOW_MEMORY:
             return self.retrieve_workflow_by_query(query, limit)
         elif memory_store_type == MemoryType.SHORT_TERM_MEMORY:
-            return self.short_term_memory_collection.find(query, limit=limit)
+            return self.short_term_memory_collection.find(query, projection).limit(limit)
         elif memory_store_type == MemoryType.LONG_TERM_MEMORY:
-            return self.long_term_memory_collection.find(query, limit=limit)
+            return self.long_term_memory_collection.find(query, projection).limit(limit)
         elif memory_store_type == MemoryType.CONVERSATION_MEMORY:
-            return self.conversation_memory_collection.find(query, limit=limit)
+            return self.conversation_memory_collection.find(query, projection).limit(limit)
         elif memory_store_type == MemoryType.SUMMARIES:
             return self.retrieve_summaries_by_query(query, limit)
        
@@ -268,7 +399,7 @@ class MongoDBProvider(MemoryProvider):
             
         return None
     
-    def retrieve_by_name(self, name: str, memory_store_type: MemoryType) -> Optional[Dict[str, Any]]:
+    def retrieve_by_name(self, name: str, memory_store_type: MemoryType, include_embedding: bool = False) -> Optional[Dict[str, Any]]:
         """
         Retrieve a document from MongoDB by name.
         
@@ -278,30 +409,31 @@ class MongoDBProvider(MemoryProvider):
             The name of the document to retrieve.
         memory_store_type : MemoryType
             The type of memory store to retrieve from.
+        include_embedding : bool
+            Whether to include the embedding field in the results. Default is False for performance.
         
         Returns:
         --------
         Optional[Dict[str, Any]]
             The retrieved document, or None if not found.
         """
+        # Define projection to exclude embeddings by default
+        projection = {} if include_embedding else {"embedding": 0}
+        
         if memory_store_type == MemoryType.TOOLBOX:
-            # Use projection in find_one directly
-            return self.toolbox_collection.find_one(
-                {"name": name},
-                {"embedding": 0}
-            )
+            return self.toolbox_collection.find_one({"name": name}, projection)
         elif memory_store_type == MemoryType.PERSONAS:
-            return self.persona_collection.find_one({"name": name}, {"embedding": 0})
+            return self.persona_collection.find_one({"name": name}, projection)
         elif memory_store_type == MemoryType.WORKFLOW_MEMORY:
-            return self.workflow_memory_collection.find_one({"name": name}, {"embedding": 0})
+            return self.workflow_memory_collection.find_one({"name": name}, projection)
         elif memory_store_type == MemoryType.SHORT_TERM_MEMORY:
-            return self.short_term_memory_collection.find_one({"name": name})
+            return self.short_term_memory_collection.find_one({"name": name}, projection)
         elif memory_store_type == MemoryType.LONG_TERM_MEMORY:
-            return self.long_term_memory_collection.find_one({"name": name})
+            return self.long_term_memory_collection.find_one({"name": name}, projection)
         elif memory_store_type == MemoryType.CONVERSATION_MEMORY:
-            return self.conversation_memory_collection.find_one({"name": name})
+            return self.conversation_memory_collection.find_one({"name": name}, projection)
         elif memory_store_type == MemoryType.SUMMARIES:
-            return self.summaries_collection.find_one({"name": name}, {"embedding": 0})
+            return self.summaries_collection.find_one({"name": name}, projection)
         
 
 
@@ -644,7 +776,7 @@ class MongoDBProvider(MemoryProvider):
         return result.deleted_count > 0
             
     
-    def list_all(self, memory_store_type: MemoryType) -> List[Dict[str, Any]]:
+    def list_all(self, memory_store_type: MemoryType, include_embedding: bool = False) -> List[Dict[str, Any]]:
         """
         List all documents within a memory store type in MongoDB.
 
@@ -652,29 +784,33 @@ class MongoDBProvider(MemoryProvider):
         -----------
         memory_store_type : MemoryType
             The type of memory store (e.g., "persona", "toolbox", etc.)
+        include_embedding : bool
+            Whether to include the embedding field in the results. Default is False for performance.
         
         Returns:
         --------
         List[Dict[str, Any]]
             The list of all documents from MongoDB.
         """
+        # Define projection to exclude embeddings by default
+        projection = {} if include_embedding else {"embedding": 0}
 
         if memory_store_type == MemoryType.PERSONAS:
-            return list(self.persona_collection.find({}, {"embedding": 0}))
+            return list(self.persona_collection.find({}, projection))
         elif memory_store_type == MemoryType.TOOLBOX:
-            return list(self.toolbox_collection.find({}, {"embedding": 0}))
+            return list(self.toolbox_collection.find({}, projection))
         elif memory_store_type == MemoryType.SHORT_TERM_MEMORY:
-            return list(self.short_term_memory_collection.find())
+            return list(self.short_term_memory_collection.find({}, projection))
         elif memory_store_type == MemoryType.LONG_TERM_MEMORY:
-            return list(self.long_term_memory_collection.find())
+            return list(self.long_term_memory_collection.find({}, projection))
         elif memory_store_type == MemoryType.CONVERSATION_MEMORY:
-            return list(self.conversation_memory_collection.find())
+            return list(self.conversation_memory_collection.find({}, projection))
         elif memory_store_type == MemoryType.WORKFLOW_MEMORY:
-            return list(self.workflow_memory_collection.find())
+            return list(self.workflow_memory_collection.find({}, projection))
         elif memory_store_type == MemoryType.SHARED_MEMORY:
-            return list(self.shared_memory_collection.find())
+            return list(self.shared_memory_collection.find({}, projection))
         elif memory_store_type == MemoryType.SUMMARIES:
-            return list(self.summaries_collection.find({}, {"embedding": 0}))
+            return list(self.summaries_collection.find({}, projection))
         else:
             logger.warning(f"Unsupported memory store type for list_all: {memory_store_type}")
             return []
@@ -757,7 +893,7 @@ class MongoDBProvider(MemoryProvider):
         return self.update_by_id(id, data, MemoryType.TOOLBOX)
     
 
-    def retrieve_conversation_history_ordered_by_timestamp(self, memory_id: str) -> List[Dict[str, Any]]:
+    def retrieve_conversation_history_ordered_by_timestamp(self, memory_id: str, include_embedding: bool = False) -> List[Dict[str, Any]]:
         """
         Retrieve the conversation history ordered by timestamp.
 
@@ -765,17 +901,20 @@ class MongoDBProvider(MemoryProvider):
         -----------
         memory_id : str
             The id of the memory to retrieve the conversation history for.
+        include_embedding : bool
+            Whether to include the embedding field in the results. Default is False for performance.
 
         Returns:
         --------
         List[Dict[str, Any]]
             The conversation history ordered by timestamp.
         """
-        return list(self.conversation_memory_collection.find({"memory_id": memory_id}, {"embedding": 0}).sort("timestamp", 1))
+        projection = {} if include_embedding else {"embedding": 0}
+        return list(self.conversation_memory_collection.find({"memory_id": memory_id}, projection).sort("timestamp", 1))
     
-    def retrieve_memory_components_by_query(self, query: str = None, query_embedding: list[float] = None, memory_id: str = None, memory_type: MemoryType = None, limit: int = 5) -> List[Dict[str, Any]]:
+    def retrieve_memory_units_by_query(self, query: str = None, query_embedding: list[float] = None, memory_id: str = None, memory_type: MemoryType = None, limit: int = 5) -> List[Dict[str, Any]]:
         """
-        Retrieve memory components by query.
+        Retrieve memory units by query.
 
         Parameters:
         -----------
@@ -784,31 +923,33 @@ class MongoDBProvider(MemoryProvider):
         query_embedding : list[float]
             The embedding of the query.
         memory_id : str
-            The id of the memory to retrieve the memory components for.
+            The id of the memory to retrieve the memory units for.
         memory_type : MemoryType
-            The type of memory to retrieve the memory components for.
+            The type of memory to retrieve the memory units for.
         limit : int
-            The maximum number of memory components to return.
+            The maximum number of memory units to return.
 
         Returns:
         --------
         List[Dict[str, Any]]
-            The memory components ordered by timestamp.
+            The memory units ordered by timestamp.
         """
 
         # Detect the memory type
         if memory_type == MemoryType.CONVERSATION_MEMORY:
-            return self.get_conversation_memory_components(query, query_embedding, memory_id, limit)
-        elif memory_type == MemoryType.TASK_MEMORY:
-            pass
-            # TODO: return self.get_task_memory_components(query, memory_id, limit)
+            return self.get_conversation_memory_units(query, query_embedding, memory_id, limit)
         elif memory_type == MemoryType.WORKFLOW_MEMORY:
-            return self.get_workflow_memory_components(query, query_embedding, memory_id, limit)
+            return self.get_workflow_memory_units(query, query_embedding, memory_id, limit)
+        elif memory_type == MemoryType.SUMMARIES:
+            return self.get_summaries_memory_units(query, query_embedding, memory_id, limit)
+        else:
+            # Return empty list for unsupported memory types
+            return []
 
 
-    def get_conversation_memory_components(self, query: str = None, query_embedding: list[float] = None, memory_id: str = None, limit: int = 5) -> List[Dict[str, Any]]:
+    def get_conversation_memory_units(self, query: str = None, query_embedding: list[float] = None, memory_id: str = None, limit: int = 5) -> List[Dict[str, Any]]:
         """
-        Get the conversation memory components.
+        Get the conversation memory units.
 
         Parameters:
         -----------
@@ -817,14 +958,72 @@ class MongoDBProvider(MemoryProvider):
         query_embedding : list[float]
             The embedding of the query.
         memory_id : str
-            The id of the memory to retrieve the memory components for.
+            The id of the memory to retrieve the memory units for.
         limit : int
-            The maximum number of memory components to return.
+            The maximum number of memory units to return.
 
         Returns:
         --------
         List[Dict[str, Any]]
-            The memory components ordered by timestamp.
+            The memory units ordered by timestamp.
+        """
+
+        # Ensure vector index exists for conversation memory (lazy creation)
+        if self.config.lazy_vector_indexes:
+            self._ensure_vector_index_for_collection(
+                self.conversation_memory_collection, 
+                "conversation_memory", 
+                memory_store=True
+            )
+
+        # If the query embedding is not provided, then we create it
+        if query_embedding is None and query is not None:
+            query_embedding = get_embedding(query)
+
+        vector_stage = {
+            "$vectorSearch": {
+                "index": "vector_index",
+                "queryVector": query_embedding,
+                "path": "embedding",
+                "numCandidates": 100,
+                "limit": limit,
+                "filter": {"memory_id": memory_id}
+            }
+        }
+
+        # Add the vector stage to the pipeline
+        pipeline = [
+            vector_stage,
+            {"$addFields": {"score": {"$meta": "vectorSearchScore"}}},
+            {"$project": {"embedding": 0}},
+            {"$sort": {"score": -1, "timestamp": 1}},
+        ]
+
+        # Execute the pipeline
+        results = list(self.conversation_memory_collection.aggregate(pipeline))
+
+        # Return the results
+        return results
+
+    def get_summaries_memory_units(self, query: str = None, query_embedding: list[float] = None, memory_id: str = None, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Get the summaries memory units.
+
+        Parameters:
+        -----------
+        query : str
+            The query to use for retrieval.
+        query_embedding : list[float]
+            The embedding of the query.
+        memory_id : str
+            The id of the memory to retrieve the memory units for.
+        limit : int
+            The maximum number of memory units to return.
+
+        Returns:
+        --------
+        List[Dict[str, Any]]
+            The memory units ordered by timestamp.
         """
 
         # If the query embedding is not provided, then we create it
@@ -846,11 +1045,70 @@ class MongoDBProvider(MemoryProvider):
         pipeline = [
             vector_stage,
             {"$addFields": {"score": {"$meta": "vectorSearchScore"}}},
+            {"$project": {"embedding": 0}},
+            {"$sort": {"score": -1, "created_at": -1}},
+        ]
+
+        # Execute the pipeline
+        results = list(self.summaries_collection.aggregate(pipeline))
+
+        # Return the results
+        return results
+
+    def get_workflow_memory_units(self, query: str = None, query_embedding: list[float] = None, memory_id: str = None, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Get the workflow memory units.
+
+        Parameters:
+        -----------
+        query : str
+            The query to use for retrieval.
+        query_embedding : list[float]
+            The embedding of the query.
+        memory_id : str
+            The id of the memory to retrieve the memory units for.
+        limit : int
+            The maximum number of memory units to return.
+
+        Returns:
+        --------
+        List[Dict[str, Any]]
+            The memory units ordered by timestamp.
+        """
+
+        # Ensure vector index exists for workflow memory (lazy creation)
+        if self.config.lazy_vector_indexes:
+            self._ensure_vector_index_for_collection(
+                self.workflow_memory_collection,
+                "workflow_memory", 
+                memory_store=True
+            )
+
+        # If the query embedding is not provided, then we create it
+        if query_embedding is None and query is not None:
+            query_embedding = get_embedding(query)
+
+        vector_stage = {
+            "$vectorSearch": {
+                "index": "vector_index",
+                "queryVector": query_embedding,
+                "path": "embedding",
+                "numCandidates": 100,
+                "limit": limit,
+                "filter": {"memory_id": memory_id}
+            }
+        }
+
+        # Add the vector stage to the pipeline
+        pipeline = [
+            vector_stage,
+            {"$addFields": {"score": {"$meta": "vectorSearchScore"}}},
+            {"$project": {"embedding": 0}},
             {"$sort": {"score": -1, "timestamp": 1}},
         ]
 
         # Execute the pipeline
-        results = list(self.conversation_memory_collection.aggregate(pipeline))
+        results = list(self.workflow_memory_collection.aggregate(pipeline))
 
         # Return the results
         return results
@@ -941,7 +1199,7 @@ class MongoDBProvider(MemoryProvider):
         # Get the document from MongoDB using _id
         try:
             if ObjectId.is_valid(agent_id):
-                document = self.memagent_collection.find_one({"_id": ObjectId(agent_id)})
+                document = self.memagent_collection.find_one({"_id": ObjectId(agent_id)}, {"embedding": 0})            
             else:
                 return None
         except Exception:
@@ -1001,7 +1259,7 @@ class MongoDBProvider(MemoryProvider):
             The list of memagents.
         """
         
-        documents = list(self.memagent_collection.find())
+        documents = list(self.memagent_collection.find({}, {"embedding": 0}))        
         agents = []
         
         for doc in documents:
@@ -1109,7 +1367,7 @@ class MongoDBProvider(MemoryProvider):
         agent_id : str
             The id of the memagent to delete.
         cascade : bool
-            Whether to cascade the deletion of the memagent. This deletes all the memory components associated with the memagent by deleting the memory_ids and their corresponding memory store in the memory provider.
+            Whether to cascade the deletion of the memagent. This deletes all the memory units associated with the memagent by deleting the memory_ids and their corresponding memory store in the memory provider.
 
         Returns:
         --------
@@ -1123,11 +1381,11 @@ class MongoDBProvider(MemoryProvider):
             if memagent is None:
                 raise ValueError(f"MemAgent with id {agent_id} not found")
             
-            # Delete all the memory components associated with the memagent by deleting the memory_ids and their corresponding memory store in the memory provider.
+            # Delete all the memory units associated with the memagent by deleting the memory_ids and their corresponding memory store in the memory provider.
             for memory_id in memagent.memory_ids:
                 # Loop through all the memory stores and delete records with the memory_ids
                 for memory_type in MemoryType:
-                    self._delete_memory_components_by_memory_id(memory_id, memory_type)
+                    self._delete_memory_units_by_memory_id(memory_id, memory_type)
         else:
             try:
                 if ObjectId.is_valid(agent_id):
@@ -1140,9 +1398,9 @@ class MongoDBProvider(MemoryProvider):
 
         return True
     
-    def _delete_memory_components_by_memory_id(self, memory_id: str, memory_type: MemoryType):
+    def _delete_memory_units_by_memory_id(self, memory_id: str, memory_type: MemoryType):
         """
-        Delete all the memory components associated with the memory_id.
+        Delete all the memory units associated with the memory_id.
 
         Parameters:
         -----------
@@ -1158,8 +1416,7 @@ class MongoDBProvider(MemoryProvider):
         """
         if memory_type == MemoryType.CONVERSATION_MEMORY:
             self.conversation_memory_collection.delete_many({"memory_id": memory_id})
-        elif memory_type == MemoryType.TASK_MEMORY:
-            self.task_memory_collection.delete_many({"memory_id": memory_id})
+
         elif memory_type == MemoryType.WORKFLOW_MEMORY:
             self.workflow_memory_collection.delete_many({"memory_id": memory_id})
         elif memory_type == MemoryType.SHORT_TERM_MEMORY:
@@ -1190,15 +1447,15 @@ class MongoDBProvider(MemoryProvider):
                 {
                     "type": "vector",
                     "path": "embedding",
-                    # TODO: Make this dynamic based on the embedding model
-                    "numDimensions": get_embedding_dimensions("text-embedding-3-small"),
+                    # Dynamic dimensions based on the configured embedding provider
+                    "numDimensions": self._get_embedding_dimensions_safe(),
                     "similarity": "cosine",
                 }
             ]
         }
 
         # If the memory store is true, then we add the memory_id field to the index
-        # This is used to prefilter the memory components by memory_id
+        # This is used to prefilter the memory units by memory_id
         # useful to narrow the scope of your semantic search and ensure that not all vectors are considered for comparison. 
         # It reduces the number of documents against which to run similarity comparisons, which can decrease query latency and increase the accuracy of search results.
         if memory_store:

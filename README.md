@@ -86,11 +86,35 @@ response = agent.run("What did I tell you about myself?")
 print(response)  # Agent remembers John is a software engineer
 ```
 
+
+# Add a table tof single agent and multi agent and description and then link to their example notebooks
+# Table of single agent and multi-agent setups, their descriptions, and links to example notebooks
+| Agent Type                | Description                                                                 | Example Notebook                                                                 |
+|---------------------------|-----------------------------------------------------------------------------|----------------------------------------------------------------------------------|
+| Single Agent              | A standalone agent with its own memory and persona, suitable for individual tasks | [Single Agent Example](examples/memagent_single_agent.ipynb)                      |
+| Multi-Agent               | A system of multiple agents collaborating, each with specialized roles and shared memory | [Multi-Agent Example](examples/memagents_multi_agents.ipynb)                        |
+
+
+
+# Memory System Components and Examples
+
+| Memory Component | Memory Category | Use Case / Description | Example Notebook |
+|------------------|-----------------|------------------------|------------------|
+| **Persona** | Semantic Memory | Agent identity, personality, and behavioral consistency | [Persona Example](examples/persona.ipynb) |
+| **Knowledge Base** | Semantic Memory | Persistent facts, concepts, and domain knowledge | [Knowledge Base Example](examples/knowledge_base.ipynb) |
+| **Toolbox** | Procedural Memory | Registered functions with semantic discovery for LLM execution | [Toolbox Example](examples/toolbox.ipynb) |
+| **Workflow** | Procedural Memory | Multi-step process orchestration and execution tracking | [Workflow Example](examples/workflow.ipynb) |
+| **Conversation Memory** | Episodic Memory | Interaction history and conversational context | [Single Agent Example](examples/memagent_single_agent.ipynb) |
+| **Summaries** | Episodic Memory | Compressed episodic experiences and events | [Summarization Example](examples/memagent_summarisation.ipynb) |
+| **Working Memory** | Short-term Memory | Active context management and current session state | [Single Agent Example](examples/memagent_single_agent.ipynb) |
+| **Shared Memory** | Multi-Agent Coordination | Blackboard for inter-agent communication and coordination | [Multi-Agent Example](examples/memagents_multi_agents.ipynb) |
+
+
 ### 2. Creating Specialized Agents with Personas
 
 ```python
-from memorizz.persona import Persona
-from memorizz.persona.role_type import RoleType
+from memorizz.long_term_memory.semantic.persona import Persona
+from memorizz.long_term_memory.semantic.persona.role_type import RoleType
 
 # Create a technical expert persona using predefined role types
 tech_expert = Persona(

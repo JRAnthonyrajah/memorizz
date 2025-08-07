@@ -22,10 +22,12 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 # Place in environment variables
-os.environ["OPENAI_API_KEY"] = ""
+os.environ["MEMORIZZ_LOG_LEVEL"] = "WARNING"
 os.environ["MONGODB_URI"] = ""
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["VOYAGE_API_KEY"] = ""
+
 try:
-    # We no longer need HuggingFace datasets since we're working with local JSON files
     pass
 except ImportError:
     pass
@@ -64,7 +66,7 @@ class LongMemEvalEvaluator:
     
     def __init__(self, 
                  dataset_variant: str = "oracle",
-                 memory_mode: str = "general",
+                 application_mode: str = "assistant",
                  output_dir: str = "./results",
                  verbose: bool = False):
         """
@@ -72,12 +74,12 @@ class LongMemEvalEvaluator:
         
         Args:
             dataset_variant: LongMemEval variant ("oracle", "s", "m")
-            memory_mode: Memorizz memory mode to use
+            application_mode: Memorizz application mode to use
             output_dir: Directory to save results
             verbose: Enable verbose logging
         """
         self.dataset_variant = dataset_variant
-        self.memory_mode = memory_mode
+        self.application_mode = application_mode
         self.output_dir = Path(output_dir)
         self.verbose = verbose
         
@@ -113,7 +115,13 @@ class LongMemEvalEvaluator:
             return MemoryProvider()
         
         try:
-            config = MongoDBConfig(uri=mongodb_uri)
+            config = MongoDBConfig(uri=mongodb_uri,
+                db_name="testing_memorizz",
+                embedding_provider="voyageai",
+                embedding_config={
+                    "model": "voyage-3-large",
+                    "output_dimension": 256,
+                })
             return MongoDBProvider(config)
         except Exception as e:
             logger.warning(f"Failed to initialize MongoDB provider: {e}, using default")
@@ -160,10 +168,10 @@ class LongMemEvalEvaluator:
     
     def _create_fresh_agent(self) -> MemAgent:
         """Create a fresh Memorizz agent for evaluation."""
-        print("Creating fresh agent memagent with specified memory provider and memory mode")
+        print("Creating fresh agent memagent with specified memory provider and application mode")
         agent = MemAgent(
             memory_provider=self.memory_provider,
-            memory_mode=self.memory_mode,
+            application_mode=self.application_mode,
             instruction="You are a helpful assistant with excellent memory. Pay close attention to all conversations and remember important details about users and their preferences."
         )
         
@@ -419,7 +427,7 @@ Only respond with the JSON object.
             "metadata": {
                 "timestamp": datetime.now().isoformat(),
                 "dataset_variant": self.dataset_variant,
-                "memory_mode": self.memory_mode,
+                "application_mode": self.application_mode,
                 "num_samples": len(results),
                 "total_processing_time": sum(r["processing_time"] for r in results)
             },
@@ -435,7 +443,7 @@ Only respond with the JSON object.
         """Save evaluation results to JSON file."""
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"longmemeval_{self.dataset_variant}_{self.memory_mode}_{timestamp}.json"
+            filename = f"longmemeval_{self.dataset_variant}_{self.application_mode}_{timestamp}.json"
         
         filepath = self.output_dir / filename
         
@@ -454,8 +462,8 @@ def main():
                         help="LongMemEval dataset variant to use")
     parser.add_argument("--num_samples", type=int, default=50,
                         help="Number of samples to evaluate")
-    parser.add_argument("--memory_mode", type=str, default="general",
-                        help="Memorizz memory mode to use")
+    parser.add_argument("--application_mode", type=str, default="assistant",
+                        help="Memorizz application mode to use")
     parser.add_argument("--output_dir", type=str, default="./results",
                         help="Directory to save results")
     parser.add_argument("--verbose", action="store_true",
@@ -472,7 +480,7 @@ def main():
         # Initialize evaluator
         evaluator = LongMemEvalEvaluator(
             dataset_variant=args.dataset_variant,
-            memory_mode=args.memory_mode,
+            application_mode=args.application_mode,
             output_dir=args.output_dir,
             verbose=args.verbose
         )
@@ -488,7 +496,7 @@ def main():
         print("EVALUATION SUMMARY")
         print("="*50)
         print(f"Dataset Variant: {args.dataset_variant}")
-        print(f"Memory Mode: {args.memory_mode}")
+        print(f"Application Mode: {args.application_mode}")
         print(f"Samples Evaluated: {results['metadata']['num_samples']}")
         print(f"Overall Accuracy: {results['overall_accuracy']:.3f}")
         print(f"Overall Score: {results['overall_score']:.3f}")

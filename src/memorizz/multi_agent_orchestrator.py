@@ -1,7 +1,7 @@
 import asyncio
 import concurrent.futures
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
-from .shared_memory.shared_memory import SharedMemory
+from .coordination.shared_memory.shared_memory import SharedMemory
 from .task_decomposition import TaskDecomposer, SubTask
 import logging
 from datetime import datetime
