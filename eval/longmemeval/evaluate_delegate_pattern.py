@@ -21,16 +21,18 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 # Place in environment variables
-os.environ["OPENAI_API_KEY"] = ""
+os.environ["MEMORIZZ_LOG_LEVEL"] = "WARNING"
 os.environ["MONGODB_URI"] = ""
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["VOYAGE_API_KEY"] = ""
 
 try:
     from src.memorizz import MemAgent, MemoryProvider
     from src.memorizz.memory_provider.mongodb.provider import MongoDBProvider, MongoDBConfig
     from src.memorizz.llms.openai import OpenAI
     from src.memorizz.multi_agent_orchestrator import MultiAgentOrchestrator
-    from src.memorizz.persona.persona import Persona
-    from src.memorizz.persona.role_type import RoleType
+    from src.memorizz.long_term_memory.semantic.persona.persona import Persona
+    from src.memorizz.long_term_memory.semantic.persona.role_type import RoleType
 except ImportError as e:
     print(f"Error importing Memorizz: {e}")
     sys.exit(1)
@@ -51,11 +53,11 @@ class LongMemEvalDelegateEvaluator:
     
     def __init__(self, 
                  dataset_variant: str = "oracle",
-                 memory_mode: str = "general",
+                 application_mode: str = "assistant",
                  output_dir: str = "./results",
                  verbose: bool = False):
         self.dataset_variant = dataset_variant
-        self.memory_mode = memory_mode
+        self.application_mode = application_mode
         self.output_dir = Path(output_dir)
         self.verbose = verbose
         
@@ -138,7 +140,7 @@ class LongMemEvalDelegateEvaluator:
         # Memory Specialist Agent
         memory_specialist = MemAgent(
             memory_provider=self.memory_provider,
-            memory_mode=self.memory_mode,
+            application_mode=self.application_mode,
             instruction="You are a memory specialist. Focus on retrieving, organizing, and recalling information from conversations. Remember user preferences, past interactions, and important contextual details.",
             persona=Persona(
                 name="Memory Specialist",
@@ -152,7 +154,7 @@ class LongMemEvalDelegateEvaluator:
         # Temporal Reasoning Agent
         temporal_agent = MemAgent(
             memory_provider=self.memory_provider,
-            memory_mode=self.memory_mode,
+            application_mode=self.application_mode,
             instruction="You are a temporal reasoning specialist. Handle time-based queries, understand sequences of events, and reason about when things happened in conversations.",
             persona=Persona(
                 name="Temporal Specialist",
@@ -166,7 +168,7 @@ class LongMemEvalDelegateEvaluator:
         # Context Integration Agent
         context_agent = MemAgent(
             memory_provider=self.memory_provider,
-            memory_mode=self.memory_mode,
+            application_mode=self.application_mode,
             instruction="You are a context integration specialist. Connect information across different conversation sessions and identify patterns in user behavior and preferences.",
             persona=Persona(
                 name="Context Integrator",
@@ -190,7 +192,7 @@ class LongMemEvalDelegateEvaluator:
         # Create root agent
         root_agent = MemAgent(
             memory_provider=self.memory_provider,
-            memory_mode=self.memory_mode,
+            application_mode=self.application_mode,
             instruction="You are a coordinating agent that manages a team of memory specialists. Analyze complex memory queries and delegate tasks to appropriate specialists for optimal results."
         )
         root_agent.save()
@@ -327,8 +329,8 @@ def main():
                        help="Dataset variant to use")
     parser.add_argument("--samples", type=int, default=50,
                        help="Number of samples to evaluate")
-    parser.add_argument("--memory-mode", default="general",
-                       help="Memory mode to use")
+    parser.add_argument("--application-mode", default="assistant",
+                       help="Application mode to use")
     parser.add_argument("--output-dir", default="./results",
                        help="Output directory for results")
     parser.add_argument("--verbose", action="store_true",
@@ -339,7 +341,7 @@ def main():
     # Initialize evaluator
     evaluator = LongMemEvalDelegateEvaluator(
         dataset_variant=args.variant,
-        memory_mode=args.memory_mode,
+        application_mode=args.application_mode,
         output_dir=args.output_dir,
         verbose=args.verbose
     )

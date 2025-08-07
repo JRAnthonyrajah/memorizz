@@ -22,15 +22,22 @@ class MongoDBToolsConfig:
     collection_name: str = 'tools'
     vector_search_candidates: int = 150,
     vector_index_name: str = "vector_index"
-    get_embedding: callable = None
+    get_embedding: callable = None  # Optional - will use global embedding manager if not provided
 
 
 class MongoDBTools:
     def __init__(self, config: MongoDBToolsConfig = MongoDBToolsConfig()):
         self.config = config
+        
+        # Use provided embedding function or fall back to global embedding manager
         if not self.config.get_embedding:
-            #throw error
-            raise ValueError("get_embedding function is not provided")
+            try:
+                # Import here to avoid circular imports
+                from ...embeddings import get_embedding
+                self.config.get_embedding = get_embedding
+                logger.info("Using global embedding configuration for MongoDB tools")
+            except ImportError:
+                raise ValueError("get_embedding function is not provided and global embedding configuration is not available")
         if self.config.mongo_uri is None:
             self.config.mongo_uri = os.getenv('MONGO_URI') or getpass.getpass("Enter MongoDB URI: ")
         
@@ -66,6 +73,46 @@ class MongoDBTools:
         
         if self.tools_collection is None:
             logger.warning("MongoDBTools initialization failed. Some features may not work.")
+    
+    def _get_embedding_dimensions(self) -> int:
+        """
+        Get embedding dimensions from the centralized configuration or by probing.
+        
+        Returns:
+        --------
+        int
+            The number of dimensions for embeddings
+        """
+        try:
+            from ...embeddings import get_embedding_dimensions
+            return get_embedding_dimensions()
+        except ImportError:
+            # Fallback to probing with dummy embedding
+            logger.warning("Using fallback dimension detection. Consider using centralized embedding configuration.")
+            return len(self.config.get_embedding("test"))
+
+    def create_vector_index_definition(self) -> Dict[str, Any]:
+        """
+        Create a vector index definition with the correct dimensions from the embedding configuration.
+        
+        Returns:
+        --------
+        Dict[str, Any]
+            Vector index definition dictionary with correct dimensions
+        """
+        dimensions = self._get_embedding_dimensions()
+        return {
+            "mappings": {
+                "dynamic": True,
+                "fields": {
+                    "embedding": {
+                        "dimensions": dimensions,
+                        "similarity": "cosine",
+                        "type": "knnVector",
+                    }
+                }
+            }
+        }
 
     def mongodb_toolbox(self, collection: Optional[Collection] = None):
         if collection is None:
@@ -253,18 +300,8 @@ class MongoDBTools:
             index_exists = any(index['name'] == self.config.vector_index_name for index in indexes)
             
             if not index_exists:
-                vector_index_definition = {
-                    "mappings": {
-                        "dynamic": True,
-                        "fields": {
-                            "embedding": {
-                                "dimensions": len(self.config.get_embedding("0")),
-                                "similarity": "cosine",
-                                "type": "knnVector",
-                            }
-                        }
-                    }
-                }
+                # Create vector index definition with correct dimensions
+                vector_index_definition = self.create_vector_index_definition()
                 try:
                     # Create SearchIndexModel and use it in create_search_index
                     search_index_model = SearchIndexModel(

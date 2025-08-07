@@ -1,37 +1,40 @@
-from .toolbox import Toolbox
-from .llms.openai import OpenAI
-from .persona import Persona
-from typing import Optional, Union, List, Dict, Any
-import json
-from .memory_component import MemoryComponent, ConversationMemoryComponent
-from datetime import datetime
 import uuid
-from .memory_provider import MemoryProvider
-from .memory_component.application_mode import ApplicationMode, ApplicationModeConfig
-from .memory_provider.memory_type import MemoryType
+import json
 import logging
-from pydantic import BaseModel
-from .toolbox.tool_schema import ToolSchemaType
-from typing import Callable
-from .workflow.workflow import Workflow, WorkflowOutcome
-from .context_window_management.cwm import CWM
-from .long_term_memory import KnowledgeBase
-from bson import ObjectId
+import os
+from datetime import datetime
+from typing import Optional, Union, List, Dict, Any
+from dataclasses import dataclass
 from enum import Enum
+from pydantic import BaseModel
+from bson import ObjectId
 
+from .llms.openai import OpenAI
+from .memory_provider import MemoryProvider
+from .memory_unit import MemoryUnit
+from .long_term_memory.episodic.conversational_memory_unit import ConversationMemoryUnit
+from .enums import Role, ApplicationMode, ApplicationModeConfig, MemoryType
+from .short_term_memory.working_memory.cwm import CWM
+from .long_term_memory.semantic.knowledge_base import KnowledgeBase
+from .long_term_memory.procedural.workflow.workflow import Workflow, WorkflowOutcome
+from .long_term_memory.procedural.toolbox.toolbox import Toolbox
+from .long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
+from .long_term_memory.semantic.persona.persona import Persona
+from .embeddings import configure_embeddings
+from typing import Callable
+
+# Configure logging based on environment variable
+MEMORIZZ_LOG_LEVEL = os.getenv('MEMORIZZ_LOG_LEVEL', 'WARNING').upper()
 logger = logging.getLogger(__name__)
+
+# Set package-wide logging level
+memorizz_logger = logging.getLogger('src.memorizz')
+memorizz_logger.setLevel(getattr(logging, MEMORIZZ_LOG_LEVEL, logging.WARNING))
 
 # Configuration constants
 DEFAULT_INSTRUCTION = "You are a helpful assistant."
 DEFAULT_MAX_STEPS = 20
 DEFAULT_TOOL_ACCESS = "private"
-
-class Role(Enum):
-    """Enumeration of conversation roles for type safety and better IDE support."""
-    USER = "user"
-    ASSISTANT = "assistant"
-    DEVELOPER = "developer"
-    TOOL = "tool"
 
 class MemAgentModel(BaseModel):
     model: Optional[OpenAI] = None
@@ -46,6 +49,7 @@ class MemAgentModel(BaseModel):
     tool_access: Optional[str] = DEFAULT_TOOL_ACCESS
     long_term_memory_ids: Optional[List[str]] = None
     delegates: Optional[List[str]] = None  # Store delegate agent IDs
+    embedding_config: Optional[Dict[str, Any]] = None
     
     model_config = {
         "arbitrary_types_allowed": True  # Allow arbitrary types like Toolbox
@@ -66,16 +70,48 @@ class MemAgent:
         memory_ids: Optional[Union[str, List[str]]] = None, # Memory id(s) of the agent
         agent_id: Optional[str] = None, # Agent id of the agent
         tool_access: Optional[str] = DEFAULT_TOOL_ACCESS, # Tool access of the agent
-        delegates: Optional[List['MemAgent']] = None # Delegate agents for multi-agent mode
+        delegates: Optional[List['MemAgent']] = None, # Delegate agents for multi-agent mode
+        verbose: bool = None, # Control logging verbosity (None=use env var, True=INFO, False=WARNING)
+        embedding_provider: Optional[str] = None, # Embedding provider to use (openai, ollama)
+        embedding_config: Optional[Dict[str, Any]] = None # Configuration for the embedding provider
     ):
         # If the memory provider is not provided, then we use the default memory provider
+        if memory_provider is None:
+            logger.debug("No memory provider specified, using default MemoryProvider")
         self.memory_provider = memory_provider or MemoryProvider()
+
+        # Store direct embedding configuration if provided
+        self._direct_embedding_provider = embedding_provider
+        self._direct_embedding_config = embedding_config
+
+        # Configure embedding provider if specified
+        if embedding_provider is not None:
+            try:
+                configure_embeddings(embedding_provider, embedding_config)
+                logger.info(f"Configured embedding provider: {embedding_provider}")
+            except Exception as e:
+                logger.error(f"Failed to configure embedding provider '{embedding_provider}': {str(e)}")
+                raise
+
+        # Extract and store embedding configuration with proper priority
+        logger.debug(f"About to extract embedding config. Memory provider: {type(self.memory_provider)}")
+        if hasattr(self.memory_provider, 'config'):
+            logger.debug(f"Memory provider config: {self.memory_provider.config}")
+            logger.debug(f"Memory provider _embedding_provider: {getattr(self.memory_provider, '_embedding_provider', 'NOT_FOUND')}")
+        self.embedding_config = self._extract_embedding_config()
+        logger.debug(f"Extracted embedding config: {self.embedding_config}")
+
+        # Configure logging verbosity for this agent instance
+        if verbose is not None:
+            log_level = logging.INFO if verbose else logging.WARNING
+            memorizz_logger.setLevel(log_level)
+            logger.setLevel(log_level)
 
         # Validate and set the application mode (handles both strings and enums)
         try:
             self.application_mode = ApplicationModeConfig.validate_mode(application_mode)
         except ValueError as e:
-            print(f"Warning: {e}. Using default mode 'assistant'.")
+            logger.warning(f"{e}. Using default mode 'assistant'.")
             self.application_mode = ApplicationMode.DEFAULT
 
         # Resolve final memory types (custom memory_types override application_mode defaults)
@@ -87,18 +123,18 @@ class MemAgent:
                     try:
                         self.active_memory_types.append(MemoryType(mt.upper()))
                     except ValueError:
-                        print(f"Warning: Invalid memory type '{mt}'. Skipping.")
+                        logger.warning(f"Invalid memory type '{mt}'. Skipping.")
                 elif isinstance(mt, MemoryType):
                     self.active_memory_types.append(mt)
             
-            print(f"Using custom memory types: {[mt.value for mt in self.active_memory_types]}")
+            logger.info(f"Using custom memory types: {[mt.value for mt in self.active_memory_types]}")
         else:
             # Use default memory types from application mode
             self.active_memory_types = ApplicationModeConfig.get_memory_types(self.application_mode)
-            print(f"Using application mode '{self.application_mode.value}' with memory types: {[mt.value for mt in self.active_memory_types]}")
+            logger.info(f"Using application mode '{self.application_mode.value}' with memory types: {[mt.value for mt in self.active_memory_types]}")
 
-        # Initialize the memory component based on the application mode
-        self.memory_component = MemoryComponent(self.application_mode.value, self.memory_provider)
+        # Initialize the memory unit based on the application mode
+        self.memory_unit = MemoryUnit(self.application_mode.value, self.memory_provider)
 
         # Initialize the model - honor caller's model if provided, else use default
         # This allows users to specify their own model configuration
@@ -197,7 +233,7 @@ class MemAgent:
         """
         try:
             # Import here to avoid circular imports
-            from .shared_memory.shared_memory import SharedMemory
+            from .coordination.shared_memory.shared_memory import SharedMemory
             
             shared_memory = SharedMemory(self.memory_provider)
             
@@ -329,7 +365,7 @@ class MemAgent:
             
             # Check if this agent is part of a shared memory session
             if self._has_shared_memory_session():
-                from .shared_memory.shared_memory import SharedMemory
+                from .coordination.shared_memory.shared_memory import SharedMemory
                 shared_memory = SharedMemory(self.memory_provider)
                 active_session = shared_memory.find_active_session_for_agent(self.agent_id)
                 
@@ -353,7 +389,7 @@ class MemAgent:
     def _has_shared_memory_session(self) -> bool:
         """Check if this agent is part of any shared memory session."""
         try:
-            from .shared_memory.shared_memory import SharedMemory
+            from .coordination.shared_memory.shared_memory import SharedMemory
             shared_memory = SharedMemory(self.memory_provider)
             return shared_memory.find_active_session_for_agent(self.agent_id) is not None
         except Exception:
@@ -844,7 +880,7 @@ class MemAgent:
         
         # Check if this agent has shared memory context available and include it in memory types
         try:
-            from .shared_memory.shared_memory import SharedMemory
+            from .coordination.shared_memory.shared_memory import SharedMemory
             shared_memory = SharedMemory(self.memory_provider)
             active_session = shared_memory.find_active_session_for_agent(self.agent_id)
             if active_session:
@@ -869,8 +905,8 @@ class MemAgent:
         # 6) Add memory summaries
         augmented_query = self._add_summaries(augmented_query, query, memory_id)
 
-        # 7) Add relevant memory components
-        augmented_query = self._add_relevant_memory_components(augmented_query, query, memory_id)
+        # 7) Add relevant memory units
+        augmented_query = self._add_relevant_memory_units(augmented_query, query, memory_id)
 
         # 8) Add long-term knowledge
         augmented_query = self._add_long_term_knowledge(augmented_query, query)
@@ -937,7 +973,7 @@ class MemAgent:
         if MemoryType.SUMMARIES in self.active_memory_types:
             try:
                 # Retrieve relevant summaries based on the query
-                summaries = self._load_relevant_memory_components(
+                summaries = self._load_relevant_memory_units(
                     query, MemoryType.SUMMARIES, memory_id, limit=3
                 )
                 
@@ -967,16 +1003,16 @@ class MemAgent:
         
         return augmented_query
 
-    def _add_relevant_memory_components(self, augmented_query: str, query: str, memory_id: str) -> str:
-        """Add relevant memory components to the augmented query."""
-        # Write relevant memory components prompt
-        relevant_memory_components_prompt = "---------THIS IS YOUR RELEVANT MEMORY COMPONENTS---------\n"
-        relevant_memory_components_prompt += "\n\nRelevant memory components that may be relevant to ensure you are on the right track, use this information to guide your execution:\n"
-        augmented_query += relevant_memory_components_prompt
+    def _add_relevant_memory_units(self, augmented_query: str, query: str, memory_id: str) -> str:
+        """Add relevant memory units to the augmented query."""
+        # Write relevant memory units prompt
+        relevant_memory_units_prompt = "---------THIS IS YOUR RELEVANT MEMORY COMPONENTS---------\n"
+        relevant_memory_units_prompt += "\n\nRelevant memory units that may be relevant to ensure you are on the right track, use this information to guide your execution:\n"
+        augmented_query += relevant_memory_units_prompt
 
-        # Add conversation memory components
+        # Add conversation memory units
         if MemoryType.CONVERSATION_MEMORY in self.active_memory_types:
-            for mem in self._load_relevant_memory_components(
+            for mem in self._load_relevant_memory_units(
                 query, MemoryType.CONVERSATION_MEMORY, memory_id, limit=5
             ):
                 augmented_query += (
@@ -1026,23 +1062,28 @@ class MemAgent:
         logger.debug(f"System prompt prepared for agent {self.agent_id}")
         logger.debug(f"Augmented query length: {len(augmented_query)} characters")
         
-        # Multi-agent logging: Create separate files for each agent if in multi-agent mode
-        logger.info(f"ABOUT TO CALL _export_multi_agent_logs for agent {self.agent_id}")
-        self._export_multi_agent_logs(system_prompt, augmented_query)
-        logger.info(f"COMPLETED _export_multi_agent_logs call for agent {self.agent_id}")
+        # Multi-agent logging: Only call if actually in multi-agent mode
+        if self.is_multi_agent_mode or len(self.delegates) > 0 or self._has_shared_memory_session():
+            logger.info(f"ABOUT TO CALL _export_multi_agent_logs for agent {self.agent_id}")
+            self._export_multi_agent_logs(system_prompt, augmented_query)
+            logger.info(f"COMPLETED _export_multi_agent_logs call for agent {self.agent_id}")
+        else:
+            logger.debug(f"Skipping multi-agent logging for single-agent mode (agent {self.agent_id})")
 
     def _record_user_query(self, query: str, conversation_id: str, memory_id: str):
         """Record the user's query in conversational memory."""
         if MemoryType.CONVERSATION_MEMORY in self.active_memory_types:
             logger.info(f"Recording user query to memory - memory_id: {memory_id}, conversation_id: {conversation_id}")
-            memory_component = self._generate_conversational_memory_component({
+            memory_unit = self._generate_conversational_memory_unit({
                 "role": Role.USER,
                 "content": query,
                 "timestamp": datetime.now().isoformat(),
                 "conversation_id": conversation_id,
                 "memory_id": memory_id,
             })
-            logger.info(f"Created user memory component: {memory_component}")
+            # Remove the embedding from the memory unit for logging purposes.
+            memory_unit.embedding = None
+            logger.info(f"Created user memory unit: {memory_unit}")
         else:
             logger.warning(f"CONVERSATION_MEMORY not in active memory types for user query: {self.active_memory_types}")
 
@@ -1273,14 +1314,14 @@ class MemAgent:
         # Record into memory
         if MemoryType.CONVERSATION_MEMORY in self.active_memory_types:
             logger.info(f"Recording assistant response to memory - memory_id: {memory_id}, conversation_id: {conversation_id}")
-            memory_component = self._generate_conversational_memory_component({
+            memory_unit = self._generate_conversational_memory_unit({
                 "role": Role.ASSISTANT,
                 "content": response_text,
                 "timestamp": datetime.now().isoformat(),
                 "conversation_id": conversation_id,
                 "memory_id": memory_id,
             })
-            logger.info(f"Created memory component: {memory_component}")
+            # logger.info(f"Created memory unit: {memory_unit}")
         else:
             logger.warning(f"CONVERSATION_MEMORY not in active memory types: {self.active_memory_types}")
 
@@ -1301,57 +1342,57 @@ class MemAgent:
             memory_id (str): The memory id.
 
         Returns:
-            List[ConversationMemoryComponent]: The conversation history.
+            List[ConversationMemoryUnit]: The conversation history.
         """
 
         # If the memory id is not provided and we have memory_ids, use the most recent one
         if memory_id is None and self.memory_ids:
             memory_id = self.memory_ids[-1]
 
-        return self.memory_component.retrieve_memory_components_by_memory_id(memory_id, MemoryType.CONVERSATION_MEMORY)
+        return self.memory_unit.retrieve_memory_units_by_memory_id(memory_id, MemoryType.CONVERSATION_MEMORY)
 
-    def _load_relevant_memory_components(self, query: str, memory_type: MemoryType, memory_id: str = None, limit: int = 5):
+    def _load_relevant_memory_units(self, query: str, memory_type: MemoryType, memory_id: str = None, limit: int = 5):
         """
-        Load the relevant memory components.
+        Load the relevant memory units.
 
-        This method loads the relevant memory components based on the query.
+        This method loads the relevant memory units based on the query.
 
         Parameters:
             query (str): The user input.
             memory_id (str): The memory id.
-            limit (int): The limit of the memory components to return.
+            limit (int): The limit of the memory units to return.
 
         Returns:
-            List[ConversationMemoryComponent]: The conversation history.
+            List[ConversationMemoryUnit]: The conversation history.
         """
 
         # If the memory id is not provided and we have memory_ids, use the most recent one
         if memory_id is None and self.memory_ids:
             memory_id = self.memory_ids[-1]
 
-        # Load the relevant memory components from the memory provider
-        relevant_memory_components = self.memory_component.retrieve_memory_components_by_query(query, memory_id=memory_id, memory_type=memory_type, limit=limit)
+        # Load the relevant memory units from the memory provider
+        relevant_memory_units = self.memory_unit.retrieve_memory_units_by_query(query, memory_id=memory_id, memory_type=memory_type, limit=limit)
 
-        # Return the relevant memory components
-        return relevant_memory_components
+        # Return the relevant memory units
+        return relevant_memory_units
 
 
-    def _generate_conversational_memory_component(self, content: dict) -> ConversationMemoryComponent:
+    def _generate_conversational_memory_unit(self, content: dict) -> ConversationMemoryUnit:
         """
-        Generate the conversational memory component.
+        Generate the conversational memory unit.
 
-        This method generates the conversational memory component based on the content.
+        This method generates the conversational memory unit based on the content.
 
         Parameters:
-            content (dict): The content of the memory component.
+            content (dict): The content of the memory unit.
 
         Returns:
-            str: The conversational memory component.
+            str: The conversational memory unit.
         """
 
-        # Generate the conversational memory component
-        memory_component = self.memory_component.generate_memory_component(content)
-        return memory_component
+        # Generate the conversational memory unit
+        memory_unit = self.memory_unit.generate_memory_unit(content)
+        return memory_unit
     
     def save(self):
         """
@@ -1401,6 +1442,11 @@ class MemAgent:
                     except Exception as e:
                         logger.warning(f"Failed to save delegate {delegate.agent_id}: {e}")
         
+        # Ensure embedding_config is properly set before saving
+        if self.embedding_config is None:
+            logger.warning("Embedding config is None, attempting to refresh...")
+            self.refresh_embedding_config()
+            
         # Create a new MemAgentModel with the current object's attributes
         memagent_to_save = MemAgentModel(
             instruction=self.instruction,
@@ -1412,7 +1458,8 @@ class MemAgent:
             persona=self.persona,
             tools=tools_to_save,
             long_term_memory_ids=getattr(self, "long_term_memory_ids", None),
-            delegates=delegate_ids if delegate_ids else None  # Add delegates persistence
+            delegates=delegate_ids if delegate_ids else None,
+            embedding_config=self.embedding_config
         )
 
         # Store the memagent in the memory provider
@@ -1429,6 +1476,165 @@ class MemAgent:
 
         return self
 
+    def _extract_embedding_config(self) -> Optional[Dict[str, Any]]:
+        """Extract embedding configuration with proper priority: direct > memory_provider > global."""
+        logger.info("🔍 EXTRACTION START: _extract_embedding_config called")
+        
+        # Priority 1: Direct MemAgent parameters
+        logger.info(f"🔍 PRIORITY 1: Checking direct embedding provider: {getattr(self, '_direct_embedding_provider', None)}")
+        if getattr(self, '_direct_embedding_provider', None) is not None:
+            result = {
+                "provider": self._direct_embedding_provider,
+                "config": getattr(self, '_direct_embedding_config', {}) or {}
+            }
+            logger.info(f"✅ PRIORITY 1 SUCCESS: Extracted direct embedding config: {result}")
+            return result
+        logger.info("❌ PRIORITY 1 SKIP: No direct embedding provider")
+        
+        # Priority 2: Memory provider configuration (MongoDB provider)
+        logger.info(f"🔍 PRIORITY 2: Checking memory provider: {type(self.memory_provider).__name__}")
+        logger.info(f"🔍 PRIORITY 2: Memory provider has _embedding_provider: {hasattr(self.memory_provider, '_embedding_provider')}")
+        
+        try:
+            # Check if memory provider has the processed embedding provider (MongoDBProvider case)
+            if hasattr(self.memory_provider, '_embedding_provider'):
+                processed_provider = getattr(self.memory_provider, '_embedding_provider')
+                logger.info(f"🔍 PRIORITY 2: Processed provider type: {type(processed_provider)}")
+                logger.info(f"🔍 PRIORITY 2: Processed provider is None: {processed_provider is None}")
+                
+                if processed_provider is not None:
+                    logger.info(f"🔍 PRIORITY 2: Provider has get_provider_info: {hasattr(processed_provider, 'get_provider_info')}")
+                    
+                    if hasattr(processed_provider, 'get_provider_info'):
+                        # It's an EmbeddingManager instance
+                        try:
+                            provider_type = getattr(processed_provider, 'provider_type', None)
+                            config = getattr(processed_provider, 'config', {}) or {}
+                            logger.info(f"🔍 PRIORITY 2: Provider type: {provider_type}")
+                            logger.info(f"🔍 PRIORITY 2: Provider config: {config}")
+                            
+                            result = {
+                                "provider": provider_type.value if hasattr(provider_type, 'value') else str(provider_type),
+                                "config": config
+                            }
+                            logger.info(f"✅ PRIORITY 2 SUCCESS: Extracted from processed embedding provider: {result}")
+                            return result
+                        except Exception as e:
+                            logger.error(f"❌ PRIORITY 2 ERROR: Failed to extract from processed EmbeddingManager: {e}")
+                            import traceback
+                            logger.error(f"❌ PRIORITY 2 TRACEBACK: {traceback.format_exc()}")
+                else:
+                    logger.info("❌ PRIORITY 2 SKIP: Processed provider is None")
+            else:
+                logger.info("❌ PRIORITY 2 SKIP: Memory provider has no _embedding_provider")
+            
+            # Fallback to original config-based approach
+            logger.info(f"🔍 PRIORITY 2 FALLBACK: Checking config-based approach")
+            logger.info(f"🔍 PRIORITY 2 FALLBACK: Has config: {hasattr(self.memory_provider, 'config')}")
+            
+            if (hasattr(self.memory_provider, 'config') and 
+                self.memory_provider.config is not None and
+                hasattr(self.memory_provider.config, 'embedding_provider')):
+                
+                provider = self.memory_provider.config.embedding_provider
+                config = getattr(self.memory_provider.config, 'embedding_config', {}) or {}
+                logger.info(f"🔍 PRIORITY 2 FALLBACK: Config provider: {provider}")
+                logger.info(f"🔍 PRIORITY 2 FALLBACK: Config config: {config}")
+                
+                if provider is not None:
+                    if isinstance(provider, str):
+                        result = {"provider": provider, "config": config}
+                        logger.info(f"✅ PRIORITY 2 FALLBACK SUCCESS: Extracted memory provider string config: {result}")
+                        return result
+                    elif hasattr(provider, 'get_provider_info'):
+                        try:
+                            result = {
+                                "provider": provider.provider_type.value if hasattr(provider, 'provider_type') else str(provider),
+                                "config": getattr(provider, 'config', {}) or {}
+                            }
+                            logger.info(f"✅ PRIORITY 2 FALLBACK SUCCESS: Extracted memory provider manager config: {result}")
+                            return result
+                        except Exception as e:
+                            logger.error(f"❌ PRIORITY 2 FALLBACK ERROR: Failed to extract from EmbeddingManager: {e}")
+                else:
+                    logger.info("❌ PRIORITY 2 FALLBACK SKIP: Memory provider embedding_provider is None")
+            else:
+                logger.info(f"❌ PRIORITY 2 FALLBACK SKIP: Config check failed")
+        except Exception as e:
+            logger.error(f"❌ PRIORITY 2 ERROR: Error extracting from memory provider: {e}")
+            import traceback
+            logger.error(f"❌ PRIORITY 2 TRACEBACK: {traceback.format_exc()}")
+        
+        # Priority 3: Global embedding manager (with better error handling)
+        logger.info("🔍 PRIORITY 3: Checking global embedding manager")
+        try:
+            from .embeddings import get_embedding_manager
+            manager = get_embedding_manager()
+            logger.info(f"🔍 PRIORITY 3: Global manager type: {type(manager)}")
+            logger.info(f"🔍 PRIORITY 3: Global manager is None: {manager is None}")
+            
+            if manager and hasattr(manager, 'provider_type') and hasattr(manager, 'config'):
+                result = {
+                    "provider": manager.provider_type.value,
+                    "config": manager.config or {}
+                }
+                logger.info(f"✅ PRIORITY 3 SUCCESS: Extracted global embedding config: {result}")
+                return result
+            else:
+                logger.warning("❌ PRIORITY 3 SKIP: Global embedding manager is invalid or incomplete")
+        except Exception as e:
+            logger.error(f"❌ PRIORITY 3 ERROR: Failed to get global embedding manager: {e}")
+            import traceback
+            logger.error(f"❌ PRIORITY 3 TRACEBACK: {traceback.format_exc()}")
+        
+        logger.error("❌ EXTRACTION FAILED: Could not extract embedding config from any source")
+        return None
+
+    def get_stored_embedding_config(self) -> Optional[Dict[str, Any]]:
+        """Get the embedding configuration that was stored with this agent."""
+        return getattr(self, 'embedding_config', None)
+
+    def validate_embedding_config(self) -> Dict[str, Any]:
+        """Validate and debug the embedding configuration extraction."""
+        validation_result = {
+            "current_embedding_config": getattr(self, 'embedding_config', None),
+            "memory_provider_type": type(self.memory_provider).__name__,
+            "has_memory_provider_config": hasattr(self.memory_provider, 'config'),
+            "direct_provider": getattr(self, '_direct_embedding_provider', None),
+            "direct_config": getattr(self, '_direct_embedding_config', None)
+        }
+        
+        if hasattr(self.memory_provider, 'config'):
+            config = self.memory_provider.config
+            validation_result.update({
+                "memory_provider_config_type": type(config).__name__,
+                "memory_provider_embedding_provider": getattr(config, 'embedding_provider', 'NOT_FOUND'),
+                "memory_provider_embedding_config": getattr(config, 'embedding_config', 'NOT_FOUND')
+            })
+        
+        # Try to re-extract config to see if it works now
+        try:
+            re_extracted = self._extract_embedding_config()
+            validation_result["re_extracted_config"] = re_extracted
+        except Exception as e:
+            validation_result["re_extraction_error"] = str(e)
+        
+        return validation_result
+
+    def refresh_embedding_config(self) -> bool:
+        """Re-extract and update the embedding configuration."""
+        try:
+            new_config = self._extract_embedding_config()
+            if new_config is not None:
+                self.embedding_config = new_config
+                logger.info(f"Refreshed embedding config: {new_config}")
+                return True
+            else:
+                logger.warning("Failed to refresh embedding config - extraction returned None")
+                return False
+        except Exception as e:
+            logger.error(f"Error refreshing embedding config: {e}")
+            return False
 
     def update(self, 
                instruction: Optional[str] = None,
@@ -1636,7 +1842,7 @@ class MemAgent:
 
         Parameters:
             agent_id (str): The agent id.
-            cascade (bool): Whether to cascade the deletion of the memagent. This deletes all the memory components associated with the memagent by deleting the memory_ids and their corresponding memory store in the memory provider.
+            cascade (bool): Whether to cascade the deletion of the memagent. This deletes all the memory units associated with the memagent by deleting the memory_ids and their corresponding memory store in the memory provider.
             memory_provider (MemoryProvider): The memory provider to use.
 
         Returns:
@@ -1667,7 +1873,7 @@ class MemAgent:
             agent_id (str): The agent id to delete.
             memory_provider (Optional[MemoryProvider]): The memory provider to use.
             cascade (bool): Whether to cascade the deletion of the memagent. This deletes 
-                           all the memory components associated with the memagent.
+                           all the memory units associated with the memagent.
 
         Returns:
             bool: True if the memagent was deleted successfully, False otherwise.
@@ -1693,7 +1899,7 @@ class MemAgent:
 
         Parameters:
             cascade (bool): Whether to cascade the deletion of the memagent. This deletes 
-                           all the memory components associated with the memagent.
+                           all the memory units associated with the memagent.
 
         Returns:
             bool: True if the memagent was deleted successfully, False otherwise.
@@ -2385,9 +2591,9 @@ class MemAgent:
 
     def generate_summaries(self, days_back: int = 7, max_memories_per_summary: int = 50) -> List[str]:
         """
-        Generate summaries by compressing memory components from a specified time period.
+        Generate summaries by compressing memory units from a specified time period.
         
-        This method collects memory components from the specified time period,
+        This method collects memory units from the specified time period,
         uses an LLM to compress them into emotionally and situationally relevant summaries,
         and stores them in the summaries collection.
         
@@ -2396,7 +2602,7 @@ class MemAgent:
         days_back : int, optional
             Number of days back to include in the summary (default: 7)
         max_memories_per_summary : int, optional
-            Maximum number of memory components to include in each summary (default: 50)
+            Maximum number of memory units to include in each summary (default: 50)
             
         Returns:
         --------
@@ -2405,7 +2611,7 @@ class MemAgent:
         """
         try:
             import time
-            from .embeddings.openai import get_embedding
+            from .embeddings import get_embedding
             
             # Calculate time range (days_back days ago to now)
             current_time = time.time()
@@ -2414,13 +2620,13 @@ class MemAgent:
             logger.info(f"Generating summaries for agent {self.agent_id} from {days_back} days back")
             logger.debug(f"Time range: {start_time} to {current_time}")
             logger.debug(f"Agent memory_ids: {self.memory_ids}")
-            logger.debug(f"Active memory types: {self.memory_component.active_memory_types}")
+            logger.debug(f"Active memory types: {self.memory_unit.active_memory_types}")
             
-            # Collect memory components from all active memory types
+            # Collect memory units from all active memory types
             all_memories = []
             for memory_id in self.memory_ids:
                 logger.info(f"Searching memory_id: {memory_id}")
-                for memory_type in self.memory_component.active_memory_types:
+                for memory_type in self.memory_unit.active_memory_types:
                     if memory_type in [MemoryType.CONVERSATION_MEMORY, MemoryType.WORKFLOW_MEMORY, 
                                      MemoryType.SHORT_TERM_MEMORY, MemoryType.LONG_TERM_MEMORY]:
                         try:
@@ -2439,7 +2645,7 @@ class MemAgent:
             # Sort memories by timestamp
             all_memories.sort(key=lambda x: x.get('timestamp', 0))
             
-            logger.info(f"Found {len(all_memories)} memory components to summarize")
+            logger.info(f"Found {len(all_memories)} memory units to summarize")
             
             # Split memories into chunks and create summaries
             summary_ids = []
@@ -2457,7 +2663,7 @@ class MemAgent:
                         "summary_content": summary_content,
                         "period_start": memory_chunk[0].get('timestamp', start_time),
                         "period_end": memory_chunk[-1].get('timestamp', current_time),
-                        "memory_components_count": len(memory_chunk),
+                        "memory_units_count": len(memory_chunk),
                         "created_at": current_time,
                         "embedding": get_embedding(summary_content)
                     }
@@ -2546,7 +2752,7 @@ class MemAgent:
 
     def _get_memories_in_time_range(self, memory_id: str, memory_type: MemoryType, start_time: float, end_time: float) -> List[Dict]:
         """
-        Retrieve memory components within a specific time range.
+        Retrieve memory units within a specific time range.
         
         Parameters:
         -----------
@@ -2562,7 +2768,7 @@ class MemAgent:
         Returns:
         --------
         List[Dict]
-            List of memory components within the time range
+            List of memory units within the time range
         """
         try:
             from datetime import datetime
@@ -2624,12 +2830,12 @@ class MemAgent:
 
     def _compress_memories_with_llm(self, memories: List[Dict]) -> str:
         """
-        Use LLM to compress memory components into an emotionally and situationally relevant summary.
+        Use LLM to compress memory units into an emotionally and situationally relevant summary.
         
         Parameters:
         -----------
         memories : List[Dict]
-            List of memory components to compress
+            List of memory units to compress
             
         Returns:
         --------
@@ -2656,7 +2862,7 @@ class MemAgent:
             # Create compression prompt
             memories_text = "\n".join(memory_contents)
             compression_prompt = f"""
-            Analyze the following memory components and create a concise summary that captures:
+            Analyze the following memory units and create a concise summary that captures:
             1. Emotionally significant moments and interactions
             2. Situationally relevant context and patterns
             3. Key achievements, challenges, or learning experiences

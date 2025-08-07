@@ -30,8 +30,8 @@ try:
     from src.memorizz.memory_provider.mongodb.provider import MongoDBProvider, MongoDBConfig
     from src.memorizz.llms.openai import OpenAI
     from src.memorizz.multi_agent_orchestrator import MultiAgentOrchestrator
-    from src.memorizz.persona.persona import Persona
-    from src.memorizz.persona.role_type import RoleType
+    from src.memorizz.long_term_memory.semantic.persona.persona import Persona
+    from src.memorizz.long_term_memory.semantic.persona.role_type import RoleType
 except ImportError as e:
     print(f"Error importing Memorizz: {e}")
     sys.exit(1)
@@ -52,11 +52,11 @@ class LongMemEvalHierarchicalEvaluator:
     
     def __init__(self, 
                  dataset_variant: str = "oracle",
-                 memory_mode: str = "general",
+                 application_mode: str = "assistant",
                  output_dir: str = "./results",
                  verbose: bool = False):
         self.dataset_variant = dataset_variant
-        self.memory_mode = memory_mode
+        self.application_mode = application_mode
         self.output_dir = Path(output_dir)
         self.verbose = verbose
         
@@ -105,7 +105,7 @@ class LongMemEvalHierarchicalEvaluator:
             
             filename_map = {
                 "oracle": "longmemeval_oracle.json",
-                "s": "longmemeval_s.json", 
+                "s": "longmemeval_s.json",
                 "m": "longmemeval_m.json"
             }
             
@@ -138,7 +138,7 @@ class LongMemEvalHierarchicalEvaluator:
         # Level 1: Specialist Agents (bottom layer)
         memory_retrieval_agent = MemAgent(
             memory_provider=self.memory_provider,
-            memory_mode=self.memory_mode,
+            application_mode=self.application_mode,
             instruction="You are a memory retrieval specialist. Focus exclusively on finding and retrieving specific information from past conversations.",
             persona=Persona(
                 name="Memory Retrieval Specialist",
@@ -150,7 +150,7 @@ class LongMemEvalHierarchicalEvaluator:
         
         temporal_analysis_agent = MemAgent(
             memory_provider=self.memory_provider,
-            memory_mode=self.memory_mode,
+            application_mode=self.application_mode,
             instruction="You are a temporal analysis specialist. Focus on understanding time sequences, chronological order, and temporal relationships in conversations.",
             persona=Persona(
                 name="Temporal Analysis Specialist",
@@ -162,7 +162,7 @@ class LongMemEvalHierarchicalEvaluator:
         
         context_extraction_agent = MemAgent(
             memory_provider=self.memory_provider,
-            memory_mode=self.memory_mode,
+            application_mode=self.application_mode,
             instruction="You are a context extraction specialist. Focus on identifying patterns, relationships, and contextual information across conversations.",
             persona=Persona(
                 name="Context Extraction Specialist",
@@ -175,7 +175,7 @@ class LongMemEvalHierarchicalEvaluator:
         # Level 2: Coordination Agents (middle layer)
         memory_coordinator = MemAgent(
             memory_provider=self.memory_provider,
-            memory_mode=self.memory_mode,
+            application_mode=self.application_mode,
             instruction="You are a memory coordination manager. You oversee memory retrieval and organization, coordinating with specialist agents to provide comprehensive memory-based responses.",
             persona=Persona(
                 name="Memory Coordinator",
@@ -187,7 +187,7 @@ class LongMemEvalHierarchicalEvaluator:
         
         analysis_coordinator = MemAgent(
             memory_provider=self.memory_provider,
-            memory_mode=self.memory_mode,
+            application_mode=self.application_mode,
             instruction="You are an analysis coordination manager. You oversee temporal and contextual analysis, coordinating with analyst agents to provide detailed analytical insights.",
             persona=Persona(
                 name="Analysis Coordinator",
@@ -223,7 +223,7 @@ class LongMemEvalHierarchicalEvaluator:
         # Create executive agent (top level)
         executive_agent = MemAgent(
             memory_provider=self.memory_provider,
-            memory_mode=self.memory_mode,
+            application_mode=self.application_mode,
             instruction="You are an executive coordination agent managing a hierarchical team of memory and analysis specialists. Coordinate with branch managers to provide comprehensive responses to complex memory queries.",
             persona=Persona(
                 name="Executive Coordinator",
@@ -378,8 +378,8 @@ def main():
                        help="Dataset variant to use")
     parser.add_argument("--samples", type=int, default=50,
                        help="Number of samples to evaluate")
-    parser.add_argument("--memory-mode", default="general",
-                       help="Memory mode to use")
+    parser.add_argument("--application-mode", default="assistant",
+                       help="Application mode to use")
     parser.add_argument("--output-dir", default="./results",
                        help="Output directory for results")
     parser.add_argument("--verbose", action="store_true",
@@ -390,7 +390,7 @@ def main():
     # Initialize evaluator
     evaluator = LongMemEvalHierarchicalEvaluator(
         dataset_variant=args.variant,
-        memory_mode=args.memory_mode,
+        application_mode=args.application_mode,
         output_dir=args.output_dir,
         verbose=args.verbose
     )

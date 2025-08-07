@@ -10,7 +10,7 @@ from memorizz.memory_provider import MemoryProvider
 from memorizz.llms.openai import OpenAI
 from memorizz.memory_provider.mongodb.provider import MongoDBProvider, MongoDBConfig
 from memorizz.multi_agent_orchestrator import MultiAgentOrchestrator
-from memorizz.shared_memory.shared_memory import SharedMemory
+from memorizz.coordination.shared_memory.shared_memory import SharedMemory
 import sys
 
 # Add the src directory to the Python path
@@ -175,7 +175,7 @@ class TestMemAgentEnhancedTools(unittest.TestCase):
         """Test that existing functionality still works."""
         
         # Mock toolbox and existing methods should still work
-        from memorizz.toolbox import Toolbox
+        from memorizz.long_term_memory.procedural.toolbox import Toolbox
         mock_toolbox = MagicMock(spec=Toolbox)
         mock_toolbox.list_tools.return_value = []
         

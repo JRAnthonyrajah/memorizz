@@ -9,7 +9,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Use TYPE_CHECKING for forward references to avoid circular imports
 if TYPE_CHECKING:
-    from ..toolbox.tool_schema import ToolSchemaType
+    from ..long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
 import inspect
 
 class OpenAI:
@@ -48,7 +48,7 @@ class OpenAI:
         Dict[str, Any]
         """
         # We'll import ToolSchemaType here to avoid circular imports
-        from ..toolbox.tool_schema import ToolSchemaType
+        from ..long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
 
         docstring = func.__doc__ or ""
         signature = str(inspect.signature(func))

@@ -61,7 +61,7 @@ python evaluate_memorizz.py
 python evaluate_memorizz.py \
     --dataset_variant oracle \
     --num_samples 100 \
-    --memory_mode general \
+    --application_mode general \
     --output_dir ./results \
     --verbose
 ```
@@ -70,7 +70,7 @@ python evaluate_memorizz.py \
 
 - `--dataset_variant`: Choose from "oracle", "s", or "m" (default: "oracle")
 - `--num_samples`: Number of samples to evaluate (default: 50)
-- `--memory_mode`: Memorizz memory mode to use (default: "general")
+- `--application_mode`: Memorizz application mode to use (default: "general")
 - `--output_dir`: Directory to save results (default: "./results")
 - `--verbose`: Enable verbose logging
 
@@ -103,7 +103,7 @@ Results include:
 EVALUATION SUMMARY
 ==================================================
 Dataset Variant: oracle
-Memory Mode: general
+Application Mode: general
 Samples Evaluated: 50
 Overall Accuracy: 0.720
 Overall Score: 0.756
