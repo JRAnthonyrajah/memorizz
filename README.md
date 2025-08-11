@@ -86,8 +86,6 @@ response = agent.run("What did I tell you about myself?")
 print(response)  # Agent remembers John is a software engineer
 ```
 
-
-# Add a table tof single agent and multi agent and description and then link to their example notebooks
 # Table of single agent and multi-agent setups, their descriptions, and links to example notebooks
 | Agent Type                | Description                                                                 | Example Notebook                                                                 |
 |---------------------------|-----------------------------------------------------------------------------|----------------------------------------------------------------------------------|
