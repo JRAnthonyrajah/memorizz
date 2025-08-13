@@ -293,12 +293,16 @@ class MongoDBProvider(MemoryProvider):
         # Remove custom ID fields since we only want to use _id
         custom_id_fields = [
             "persona_id", "tool_id", "workflow_id", "short_term_memory_id", 
-            "long_term_memory_id", "agent_id"
+            "agent_id"
         ]
         
         # Don't remove conversation_id for conversation memory
         if memory_store_type != MemoryType.CONVERSATION_MEMORY:
             custom_id_fields.append("conversation_id")
+            
+        # Don't remove long_term_memory_id for long-term memory as it's needed for knowledge linking
+        if memory_store_type != MemoryType.LONG_TERM_MEMORY:
+            custom_id_fields.append("long_term_memory_id")
             
         for field in custom_id_fields:
             data_copy.pop(field, None)
@@ -643,27 +647,73 @@ class MongoDBProvider(MemoryProvider):
 
     def get_summaries_by_time_range(self, memory_id: str, start_time: float, end_time: float) -> List[Dict[str, Any]]:
         """
-        Retrieve summaries for a specific memory_id within a time range.
+        Retrieve summaries for a specific memory_id within a time range based on the period they cover.
+        
+        NOTE: This filters by the time period that the summary covers (period_start/period_end),
+        not when the summary was created. Use get_summaries_by_creation_time() to filter by creation time.
         
         Parameters:
         -----------
         memory_id : str
             The memory_id to retrieve summaries for.
         start_time : float
-            Start timestamp for the range.
+            Start timestamp for the memory period range.
         end_time : float
-            End timestamp for the range.
+            End timestamp for the memory period range.
             
         Returns:
         --------
         List[Dict[str, Any]]
-            List of summaries within the time range.
+            List of summaries whose covered period falls within the time range.
+        """
+        from datetime import datetime
+        
+        # Convert to ISO string for compatibility with existing string timestamps
+        start_iso = datetime.fromtimestamp(start_time).isoformat()
+        end_iso = datetime.fromtimestamp(end_time).isoformat()
+        
+        # Query supports both float and string timestamps
+        return list(self.summaries_collection.find({
+            "memory_id": memory_id,
+            "$or": [
+                # Float timestamps (new format)
+                {
+                    "period_start": {"$gte": start_time, "$type": "number"},
+                    "period_end": {"$lte": end_time, "$type": "number"}
+                },
+                # String timestamps (legacy format)
+                {
+                    "period_start": {"$gte": start_iso, "$type": "string"},
+                    "period_end": {"$lte": end_iso, "$type": "string"}
+                }
+            ]
+        }, {"embedding": 0}).sort("period_start", 1))
+
+    def get_summaries_by_creation_time(self, memory_id: str, start_time: float, end_time: float) -> List[Dict[str, Any]]:
+        """
+        Retrieve summaries for a specific memory_id created within a time range.
+        
+        This filters by when the summary was actually created (created_at timestamp),
+        not the time period that the summary covers.
+        
+        Parameters:
+        -----------
+        memory_id : str
+            The memory_id to retrieve summaries for.
+        start_time : float
+            Start timestamp for when summaries were created.
+        end_time : float
+            End timestamp for when summaries were created.
+            
+        Returns:
+        --------
+        List[Dict[str, Any]]
+            List of summaries created within the time range.
         """
         return list(self.summaries_collection.find({
             "memory_id": memory_id,
-            "period_start": {"$gte": start_time},
-            "period_end": {"$lte": end_time}
-        }, {"embedding": 0}).sort("period_start", 1))
+            "created_at": {"$gte": start_time, "$lte": end_time}
+        }, {"embedding": 0}).sort("created_at", -1))
 
     def delete_by_id(self, id: str, memory_store_type: MemoryType) -> bool:
         """
@@ -1217,6 +1267,7 @@ class MongoDBProvider(MemoryProvider):
             memory_ids=document.get("memory_ids") or [],
             agent_id=str(document.get("_id")),
             tools=document.get("tools"),
+            long_term_memory_ids=document.get("long_term_memory_ids"),
             memory_provider=self
         )
         
@@ -1271,6 +1322,7 @@ class MongoDBProvider(MemoryProvider):
                 memory_ids=doc.get("memory_ids") or [],
                 agent_id=str(doc.get("_id")),
                 tools=doc.get("tools"),  # Include tools from document
+                long_term_memory_ids=doc.get("long_term_memory_ids"),
                 memory_provider=self
             )
             
