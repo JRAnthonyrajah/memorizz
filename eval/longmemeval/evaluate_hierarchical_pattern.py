@@ -22,8 +22,10 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 # Place in environment variables
-os.environ["OPENAI_API_KEY"] = ""
+os.environ["MEMORIZZ_LOG_LEVEL"] = "WARNING"
 os.environ["MONGODB_URI"] = ""
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["VOYAGE_API_KEY"] = ""
 
 try:
     from src.memorizz import MemAgent, MemoryProvider

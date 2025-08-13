@@ -1462,11 +1462,18 @@ class MemAgent:
             embedding_config=self.embedding_config
         )
 
-        # Store the memagent in the memory provider
-        saved_memagent = self.memory_provider.store_memagent(memagent_to_save)
-
-        # Update the agent_id to the MongoDB _id that was generated
-        self.agent_id = str(saved_memagent["_id"])
+        # Check if this is a new agent or an existing one
+        if self.agent_id is None:
+            # New agent - store it
+            saved_memagent = self.memory_provider.store_memagent(memagent_to_save)
+            # Update the agent_id to the MongoDB _id that was generated
+            self.agent_id = str(saved_memagent["_id"])
+        else:
+            # Existing agent - update it
+            saved_memagent = self.memory_provider.update_memagent(memagent_to_save)
+            # Ensure we add the _id for logging consistency
+            if "_id" not in saved_memagent:
+                saved_memagent["_id"] = self.agent_id
 
         # Log the saved memagent
         logger.info(f"Memagent {self.agent_id} saved in the memory provider")
@@ -1726,6 +1733,7 @@ class MemAgent:
             agent_id=self.agent_id,
             persona=self.persona,
             tools=tools_to_update,
+            long_term_memory_ids=getattr(self, "long_term_memory_ids", None),
             delegates=delegate_ids if delegate_ids else None  # Add delegates persistence
         )
 
@@ -2501,8 +2509,11 @@ class MemAgent:
             # Add the ID to the agent's long-term memory IDs
             self.long_term_memory_ids.append(long_term_memory_id)
             
-            # Save the updated agent
-            self.save()
+            # Update the agent (use update for existing agents, save for new ones)
+            if self.agent_id is None:
+                self.save()
+            else:
+                self.update()
             
             return long_term_memory_id
         except Exception as e:
@@ -2656,13 +2667,26 @@ class MemAgent:
                 summary_content = self._compress_memories_with_llm(memory_chunk)
                 
                 if summary_content:
-                    # Create summary document
+                    # Helper function to convert timestamp to float
+                    def to_float_timestamp(timestamp_value, fallback_value):
+                        if isinstance(timestamp_value, str):
+                            try:
+                                from datetime import datetime
+                                return datetime.fromisoformat(timestamp_value.replace('Z', '+00:00')).timestamp()
+                            except (ValueError, AttributeError):
+                                return fallback_value
+                        elif isinstance(timestamp_value, (int, float)):
+                            return float(timestamp_value)
+                        else:
+                            return fallback_value
+                    
+                    # Create summary document with consistent float timestamps
                     summary_doc = {
                         "memory_id": self.memory_ids[0] if self.memory_ids else "default",
                         "agent_id": self.agent_id,
                         "summary_content": summary_content,
-                        "period_start": memory_chunk[0].get('timestamp', start_time),
-                        "period_end": memory_chunk[-1].get('timestamp', current_time),
+                        "period_start": to_float_timestamp(memory_chunk[0].get('timestamp'), start_time),
+                        "period_end": to_float_timestamp(memory_chunk[-1].get('timestamp'), current_time),
                         "memory_units_count": len(memory_chunk),
                         "created_at": current_time,
                         "embedding": get_embedding(summary_content)
