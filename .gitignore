@@ -41,3 +41,6 @@ dev_test.ipynb
 
 # Examples folder (local testing only)
 src/memorizz/examples/
+
+# Bug reports
+.bug_tracking/

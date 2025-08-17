@@ -32,6 +32,7 @@ MemoRizz provides flexible single and multi-agent architectures that allow you t
 - 🛠️ **Tool Integration**: Automatically discover and execute functions
 - 👤 **Persona System**: Create consistent, specialized agent personalities
 - 📊 **Vector Search**: MongoDB Atlas Vector Search for efficient retrieval
+- ⚡ **Semantic Cache**: Speed up responses and reduce costs with intelligent caching
 
 ## Key Features
 
@@ -41,6 +42,7 @@ MemoRizz provides flexible single and multi-agent architectures that allow you t
 - **Tool Registration**: Automatically convert Python functions into LLM-callable tools
 - **Persona Framework**: Create specialized agent personalities and behaviors
 - **Vector Embeddings**: Semantic similarity search across all stored information
+- **Semantic Cache**: Intelligent query-response caching with vector similarity matching
 
 ## Installation
 
@@ -105,6 +107,7 @@ print(response)  # Agent remembers John is a software engineer
 | **Conversation Memory** | Episodic Memory | Interaction history and conversational context | [Single Agent Example](examples/memagent_single_agent.ipynb) |
 | **Summaries** | Episodic Memory | Compressed episodic experiences and events | [Summarization Example](examples/memagent_summarisation.ipynb) |
 | **Working Memory** | Short-term Memory | Active context management and current session state | [Single Agent Example](examples/memagent_single_agent.ipynb) |
+| **Semantic Cache** | Short-term Memory | Vector-based query-response caching for performance optimization | [Semantic Cache Demo](examples/semantic_cache.ipynb) |
 | **Shared Memory** | Multi-Agent Coordination | Blackboard for inter-agent communication and coordination | [Multi-Agent Example](examples/memagents_multi_agents.ipynb) |
 
 
@@ -165,6 +168,75 @@ with MongoDBTools(tools_config) as tools:
     response = agent.run("What's the weather in San Francisco and calculate interest on $1000 at 5% for 3 years?")
 ```
 
+### 4. Semantic Cache for Performance Optimization
+
+Speed up your agents and reduce LLM costs with intelligent semantic caching:
+
+```python
+# Enable semantic cache on any MemAgent
+agent = MemAgent(
+    model=OpenAI(model="gpt-4"),
+    instruction="You are a helpful assistant.",
+    memory_provider=memory_provider,
+    semantic_cache=True,  # Enable semantic cache
+    semantic_cache_config={
+        "similarity_threshold": 0.85,  # Adjust sensitivity (0.0-1.0)
+        "max_cache_size": 1000,        # Maximum cached responses
+        "ttl_hours": 24.0              # Cache expiration time
+    }
+)
+
+# Similar queries will use cached responses
+response1 = agent.run("What is the capital of France?")
+response2 = agent.run("Tell me France's capital city")  # Cache hit! ⚡
+response3 = agent.run("What's the capital of Japan?")   # New query, cache miss
+
+# For external frameworks - use standalone semantic cache
+from memorizz.short_term_memory.semantic_cache import StandaloneSemanticCache
+
+cache = StandaloneSemanticCache(
+    similarity_threshold=0.8,
+    embedding_provider="openai"
+)
+
+# Integrate with any agent framework
+def my_agent(query: str) -> str:
+    # Check cache first
+    cached_response = cache.query(query)
+    if cached_response:
+        return cached_response
+    
+    # Generate new response with your LLM
+    response = your_llm_call(query)
+    
+    # Cache for future similar queries
+    cache.cache_response(query, response)
+    return response
+
+# Memory-scoped caching for multi-session isolation
+from memorizz.short_term_memory.semantic_cache import create_semantic_cache
+
+user_cache = create_semantic_cache(
+    agent_id="assistant",
+    memory_id="user_session_123",  # Isolate cache per user session
+    similarity_threshold=0.9
+)
+```
+
+**How Semantic Cache Works:**
+1. **Store queries + responses** with vector embeddings
+2. **New query arrives** → generate embedding  
+3. **Similarity search** in cache using cosine similarity
+4. **Cache hit** (similarity ≥ threshold) → return cached response ⚡
+5. **Cache miss** → fallback to LLM + cache new response
+
+**Benefits:**
+- 🚀 **Faster responses** for similar queries
+- 💰 **Reduced LLM costs** by avoiding duplicate API calls
+- 🎯 **Configurable precision** with similarity thresholds
+- 🔒 **Scoped isolation** by agent, memory, or session ID
+- 🔌 **Framework agnostic** - works with any agent system
+
 ## Core Concepts
 
 ### Memory Types
@@ -174,7 +246,7 @@ MemoRizz supports different memory categories for organizing information:
 - **CONVERSATION_MEMORY**: Chat history and dialogue context
 - **WORKFLOW_MEMORY**: Multi-step process information
 - **LONG_TERM_MEMORY**: Persistent knowledge storage with semantic search
-- **SHORT_TERM_MEMORY**: Temporary processing information
+- **SHORT_TERM_MEMORY**: Temporary processing information including semantic cache for query-response optimization
 - **PERSONAS**: Agent personality and behavior definitions
 - **TOOLBOX**: Function definitions and metadata
 - **SHARED_MEMORY**: Multi-agent coordination and communication
@@ -320,6 +392,7 @@ Check out the `examples/` directory for complete working examples:
 - **toolbox.ipynb**: Tool registration and function calling
 - **workflow.ipynb**: Workflow memory and process tracking
 - **knowledge_base.ipynb**: Long-term knowledge management
+- **semantic_cache_demo.py**: Semantic cache for performance optimization and external framework integration
 
 ## Configuration
 
