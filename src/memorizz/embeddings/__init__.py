@@ -10,6 +10,7 @@ class EmbeddingProvider(Enum):
     OPENAI = "openai"
     OLLAMA = "ollama"
     VOYAGEAI = "voyageai"
+    AZURE = "azure"
 
 class BaseEmbeddingProvider(ABC):
     """Abstract base class for embedding providers."""
