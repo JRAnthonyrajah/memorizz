@@ -8,6 +8,7 @@ import time
 import numpy as np
 import pprint
 import logging
+from ..llms.llm_provider import LLMProvider
 
 # Use lazy initialization for OpenAI
 def get_openai_llm():
@@ -15,7 +16,7 @@ def get_openai_llm():
     return OpenAI()
 
 class MemoryUnit:
-    def __init__(self, application_mode: str, memory_provider: MemoryProvider = None):
+    def __init__(self, application_mode: str, memory_provider: MemoryProvider = None, llm_provider: Optional[LLMProvider] = None):
         # Validate and set the application mode
         if isinstance(application_mode, str):
             self.application_mode = ApplicationModeConfig.validate_mode(application_mode)
@@ -24,7 +25,10 @@ class MemoryUnit:
             
         self.memory_provider = memory_provider
         self.query_embedding = None
-        
+        if llm_provider:
+            self.llm_provider = llm_provider
+        else:
+            self.llm_provider = get_openai_llm()
         # Get the memory types for this application mode
         self.active_memory_types = ApplicationModeConfig.get_memory_types(self.application_mode)
 
@@ -364,7 +368,7 @@ class MemoryUnit:
         """
 
         # Get the importance of the memory unit
-        importance = get_openai_llm().generate_text(importance_prompt, instructions="Return the importance of the memory unit as a number between 0 and 1. No other text or comments, just the number. For example: 0.5")
+        importance = self.llm_provider.generate_text(importance_prompt, instructions="Return the importance of the memory unit as a number between 0 and 1. No other text or comments, just the number. For example: 0.5")
 
         # Return the importance
         return float(importance)

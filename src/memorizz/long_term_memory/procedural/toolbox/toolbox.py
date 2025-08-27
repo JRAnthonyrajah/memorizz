@@ -14,36 +14,9 @@ from bson import ObjectId
 # This protocol defines the "contract" any compatible LLM provider must follow.
 # It's good practice to place this in a separate file (e.g., llm_provider_protocol.py)
 # but it's included here for a complete, single-file response.
-class LLMProvider(Protocol):
-    """
-    A generic protocol that defines the contract for any LLM provider
-    to be compatible with both MemAgent and Toolbox.
-    """    
-    @property
-    def client(self) -> Any:
-        """Provides direct access to the underlying API client."""
-        ...
+from ....llms.llm_provider import LLMProvider
 
-    @property
-    def model_name(self) -> str:
-        """Returns the specific model or deployment name as a string."""
-        ...
 
-    def generate_text(self, prompt: str, instructions: Optional[str] = None) -> str:
-        """A high-level method for simple text generation."""
-        ...
-        
-    def get_tool_metadata(self, func: Callable) -> ToolSchemaType:
-        """Creates structured metadata from a Python function."""
-        ...
-
-    def augment_docstring(self, docstring: str) -> str:
-        """Uses the LLM to enhance a function's docstring."""
-        ...
-
-    def generate_queries(self, docstring: str) -> List[str]:
-        """Generates a list of example user queries for a given tool."""
-        ...
 # ------------------ Step 2: Create the Default Fallback ------------------
 # This function provides the default OpenAI client if no other LLM is specified,
 # ensuring existing code continues to work without modification.

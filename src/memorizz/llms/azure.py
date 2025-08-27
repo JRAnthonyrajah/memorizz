@@ -1,8 +1,13 @@
+# src/memorizz/llms/azure.py
+
 import os
 import json
 import openai
 import logging
+import inspect
 from typing import Callable, List, Optional, TYPE_CHECKING, Dict, Any
+
+from .llm_provider import LLMProvider
 
 # Suppress httpx logs to reduce noise from API requests
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -10,15 +15,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # Use TYPE_CHECKING for forward references to avoid circular imports
 if TYPE_CHECKING:
     from ..long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
-import inspect
 
-class AzureOpenAI:
+class AzureOpenAI(LLMProvider):
     """
     A class for interacting with the Azure OpenAI API.
     """
     def __init__(
         self, 
-        api_key: Optional[str] = None, 
         azure_endpoint: Optional[str] = None,
         api_version: Optional[str] = None,
         deployment_name: str = "gpt-4o"
@@ -28,33 +31,41 @@ class AzureOpenAI:
 
         Parameters:
         -----------
-        api_key : str, optional
-            The API key for your Azure OpenAI resource. Defaults to env var AZURE_OPENAI_API_KEY.
         azure_endpoint : str, optional
-            The endpoint for your Azure OpenAI resource. Defaults to env var AZURE_OPENAI_ENDPOINT.
+            The endpoint for the Azure OpenAI API. Defaults to env var `AZURE_OPENAI_ENDPOINT`.
         api_version : str, optional
-            The API version to use. Defaults to env var OPENAI_API_VERSION.
+            The API version for the Azure OpenAI API. Defaults to env var `OPENAI_API_VERSION`.
         deployment_name : str, optional
-            The name of your model deployment in Azure. Defaults to "gpt-4o".
+            The deployment name for the model to use. Defaults to "gpt-4o".
         """
-        # Fetch credentials from environment variables if not provided
-        api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
-        azure_endpoint = azure_endpoint or os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_version = api_version or os.getenv("OPENAI_API_VERSION")
+        self._api_key = os.getenv("AZURE_OPENAI_API_KEY")
+        self.azure_endpoint = azure_endpoint or os.getenv("AZURE_OPENAI_ENDPOINT")
+        self.api_version = api_version or os.getenv("OPENAI_API_VERSION")
 
-        # Ensure all required credentials are present
-        if not all([api_key, azure_endpoint, api_version]):
+        if not all([self._api_key, self.azure_endpoint, self.api_version]):
             raise ValueError(
-                "Azure credentials not found. Please provide api_key, azure_endpoint, and api_version, "
-                "or set the AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and OPENAI_API_VERSION environment variables."
+                "Azure credentials not found. Please set the AZURE_OPENAI_API_KEY, "
+                "AZURE_OPENAI_ENDPOINT, and OPENAI_API_VERSION environment variables or "
+                "pass them as arguments."
             )
 
         self.client = openai.AzureOpenAI(
-            api_key=api_key,
-            azure_endpoint=azure_endpoint,
-            api_version=api_version,
+            api_key=self._api_key,
+            azure_endpoint=self.azure_endpoint,
+            api_version=self.api_version,
         )
-        self.deployment_name = deployment_name
+        # In Azure, the 'model' is the deployment name.
+        self.model = deployment_name
+
+    def get_config(self) -> Dict[str, Any]:
+        """Returns a serializable configuration for the AzureOpenAI provider."""
+        return {
+            "provider": "azure",
+            "deployment_name": self.model,
+            "azure_endpoint": self.azure_endpoint,
+            "api_version": self.api_version
+            # Note: We don't save the API key for security. It should be loaded from env vars.
+        }
 
     def get_tool_metadata(self, func: Callable) -> Dict[str, Any]:
         """
@@ -101,7 +112,7 @@ class AzureOpenAI:
         }
 
         response = self.client.responses.parse(
-            model=self.deployment_name, # Use deployment_name for Azure
+            model=self.model,
             input=[system_msg, user_msg],
             text_format=ToolSchemaType
         )
@@ -122,7 +133,7 @@ class AzureOpenAI:
         str
         """
         response = self.client.responses.create(
-            model=self.deployment_name, # Use deployment_name for Azure
+            model=self.model,
             input=f"Augment the docstring {docstring} by adding more details and examples."
         )
 
@@ -142,7 +153,7 @@ class AzureOpenAI:
         List[str]
         """
         response = self.client.responses.create(
-            model=self.deployment_name, # Use deployment_name for Azure
+            model=self.model,
             input=f"Generate queries for the docstring {docstring} by adding some examples of queries that can be used to leverage the tool."
         )
 
@@ -160,7 +171,7 @@ class AzureOpenAI:
             str: The generated text.
         """
         response = self.client.responses.create(
-            model=self.deployment_name, # Use deployment_name for Azure
+            model=self.model,
             instructions=instructions,
             input=prompt)
         

@@ -4,6 +4,8 @@ import openai
 import logging
 from typing import Callable, List, Optional, TYPE_CHECKING, Dict, Any
 
+from .llm_provider import LLMProvider
+
 # Suppress httpx logs to reduce noise from API requests
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -12,7 +14,7 @@ if TYPE_CHECKING:
     from ..long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
 import inspect
 
-class OpenAI:
+class OpenAI(LLMProvider):
     """
     A class for interacting with the OpenAI API.
     """
@@ -32,7 +34,13 @@ class OpenAI:
 
         self.client = openai.OpenAI(api_key=api_key)
         self.model = model
-
+        
+    def get_config(self) -> Dict[str, Any]:
+        """Returns a serializable configuration for the OpenAI provider."""
+        return {
+            "provider": "openai",
+            "model": self.model
+        }
 
     def get_tool_metadata(self, func: Callable) -> Dict[str, Any]:
         """
