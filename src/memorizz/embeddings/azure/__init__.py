@@ -4,6 +4,6 @@ OpenAI Embedding Provider
 This package contains the OpenAI embedding provider implementation.
 """
 
-from .provider import OpenAIEmbeddingProvider
+from .provider import AzureOpenAIEmbeddingProvider
 
-__all__ = ['OpenAIEmbeddingProvider'] 
+__all__ = ['AzureOpenAIEmbeddingProvider'] 

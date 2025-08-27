@@ -39,7 +39,7 @@ class AzureOpenAIEmbeddingProvider(BaseEmbeddingProvider):
         self.deployment_name = self.config.get("deployment_name")
         self.azure_endpoint = self.config.get("azure_endpoint")
         self.api_version = self.config.get("api_version")
-        self.api_key = self.config.get("api_key")
+        self.api_key = self.config.get("api_key") or os.getenv("AZURE_OPENAI_API_KEY")
 
         if not all([self.deployment_name, self.azure_endpoint, self.api_version, self.api_key]):
             raise ValueError("Configuration must include 'deployment_name', 'azure_endpoint', 'api_version', and 'api_key' for AzureOpenAIEmbeddingProvider.")

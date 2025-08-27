@@ -1,23 +1,25 @@
 from memorizz.memory_provider.mongodb.provider import MongoDBConfig, MongoDBProvider
 
-# VOYAGE_API_KEY required in .env
+# AZURE_OPENAI_API_KEY required in .env
 import os 
 
-# set environment variable VOYAGE_API_KEY
-os.environ["VOYAGE_API_KEY"] = ""
+# set environment variable AZURE_OPENAI_API_KEY
 os.environ["AZURE_OPENAI_API_KEY"] = ""
 os.environ["AZURE_OPENAI_ENDPOINT"] = ""
 os.environ["OPENAI_API_VERSION"] = "2025-04-01-preview" # Use your desired API version
 
-# Create a mongodb config with voyageai embeddings
+# Create a mongodb config with azure embeddings
 mongodb_config = MongoDBConfig(
     uri="mongodb://localhost:27017/?retryWrites=true&w=majority&directConnection=true",
     db_name="testing_memorizz",
-    embedding_provider="voyageai",
+    embedding_provider="azure",
     embedding_config={
-        "embedding_type": "contextualized",
-        "model": "voyage-context-3",
-        "output_dimension": 512,
+        "azure_endpoint": os.environ["AZURE_OPENAI_ENDPOINT"],
+        "api_version": os.environ["OPENAI_API_VERSION"],
+        "api_key": os.environ["AZURE_OPENAI_API_KEY"],
+        "deployment_name": "text-embedding-3-small",
+        "base_model": "text-embedding-3-small",
+        "dimensions": 1536,
     }
 )
 
@@ -93,11 +95,14 @@ from memorizz.long_term_memory.procedural.toolbox import Toolbox
 
 from memorizz.embeddings import configure_embeddings, get_embedding
 configure_embeddings(
-    provider="voyageai",
+    provider="azure",
     config={
-        "embedding_type": "text",
-        "model": "voyage-3.5",
-        "output_dimension": 512,
+        "azure_endpoint": os.environ["AZURE_OPENAI_ENDPOINT"],
+        "api_version": os.environ["OPENAI_API_VERSION"],
+        "api_key": os.environ["AZURE_OPENAI_API_KEY"],
+        "deployment_name": "text-embedding-3-small",
+        "base_model": "text-embedding-3-small",
+        "dimensions": 1536,
     }
 )
 

@@ -101,6 +101,9 @@ class EmbeddingManager:
         if self.provider_type == EmbeddingProvider.OPENAI:
             from .openai import OpenAIEmbeddingProvider
             return OpenAIEmbeddingProvider(self.config)
+        elif self.provider_type == EmbeddingProvider.AZURE:
+            from .azure import AzureOpenAIEmbeddingProvider
+            return AzureOpenAIEmbeddingProvider(self.config)
         elif self.provider_type == EmbeddingProvider.OLLAMA:
             from .ollama import OllamaEmbeddingProvider
             return OllamaEmbeddingProvider(self.config)
