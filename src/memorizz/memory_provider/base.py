@@ -19,7 +19,7 @@ class MemoryProvider(ABC):
         pass
 
     @abstractmethod
-    def retrieve_by_query(self, query: Dict[str, Any], memory_store_type: str, limit: int = 1) -> Optional[Dict[str, Any]]:
+    def retrieve_by_query(self, query: Dict[str, Any], memory_store_type: str, limit: int = 1, **kwargs) -> Optional[Dict[str, Any]]:
         """Retrieve a document from the memory provider."""
         pass
 

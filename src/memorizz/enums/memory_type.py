@@ -10,4 +10,5 @@ class MemoryType(Enum):
     WORKFLOW_MEMORY = "workflow_memory"
     MEMAGENT = "agents"
     SHARED_MEMORY = "shared_memory"
-    SUMMARIES = "summaries" 
+    SUMMARIES = "summaries"
+    SEMANTIC_CACHE = "semantic_cache" 
