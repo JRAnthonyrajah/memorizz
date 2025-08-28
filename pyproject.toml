@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memorizz"
-version = "0.0.29"
+version = "0.0.30"
 description = "A memory management library for Python"
 readme = "README.md"
 requires-python = ">=3.7"
@@ -33,8 +33,8 @@ dependencies = [
 [tool.hatch.metadata]
 allow-direct-references = true
 
-[tool.hatch.build.targets.wheel]
-only-include = ["src/memorizz"]
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
 
 [tool.hatch.build.targets.sdist]
 exclude = ["temp_unpack*"]

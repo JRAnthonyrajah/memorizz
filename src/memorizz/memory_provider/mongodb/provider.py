@@ -8,7 +8,7 @@ from ...enums.memory_type import MemoryType
 from ...memagent import MemAgentModel
 from ...long_term_memory.semantic.persona.persona import Persona
 from ...long_term_memory.semantic.persona.role_type import RoleType
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from pymongo.operations import SearchIndexModel
 from ...embeddings import get_embedding, get_embedding_dimensions
 
@@ -336,14 +336,15 @@ class MongoDBProvider(MemoryProvider):
             result = collection.insert_one(data_copy)
             return str(result.inserted_id)
 
-    def retrieve_by_query(self, query: Dict[str, Any], memory_store_type: MemoryType, limit: int = 1, include_embedding: bool = False, **kwargs) -> Optional[Dict[str, Any]]:
+    def retrieve_by_query(self, query: Union[Dict[str, Any], str], memory_store_type: MemoryType, limit: int = 1, include_embedding: bool = False, **kwargs) -> Optional[Dict[str, Any]]:
         """
         Retrieve a document from MongoDB.
         
         Parameters:
         -----------
-        query : Dict[str, Any]
-            The query to use for retrieval.
+        query : Union[Dict[str, Any], str]
+            The query to use for retrieval. For semantic cache, this is a string (search text).
+            For other memory types, this is a MongoDB query dict.
         limit : int
             The maximum number of documents to return.
         include_embedding : bool
@@ -375,6 +376,8 @@ class MongoDBProvider(MemoryProvider):
         elif memory_store_type == MemoryType.SUMMARIES:
             return self.retrieve_summaries_by_query(query, limit)
         elif memory_store_type == MemoryType.SEMANTIC_CACHE:
+            # For semantic cache, the query parameter is actually the search text (string)
+            # The signature is different from other memory types where query is a dict
             return self.find_similar_cache_entries(query, limit=limit, **kwargs)
        
     def retrieve_by_id(self, id: str, memory_store_type: MemoryType) -> Optional[Dict[str, Any]]:
