@@ -376,9 +376,15 @@ class MongoDBProvider(MemoryProvider):
         elif memory_store_type == MemoryType.SUMMARIES:
             return self.retrieve_summaries_by_query(query, limit)
         elif memory_store_type == MemoryType.SEMANTIC_CACHE:
-            # For semantic cache, the query parameter is actually the search text (string)
-            # The signature is different from other memory types where query is a dict
-            return self.find_similar_cache_entries(query, limit=limit, **kwargs)
+            # For semantic cache, we need to handle two different cases:
+            # 1. Dict query: Loading existing cache entries (e.g., {"agent_id": "xyz"})
+            # 2. String query: Semantic similarity search (e.g., "What is Python?")
+            if isinstance(query, dict):
+                # This is a filter query for loading existing cache entries
+                return self.semantic_cache_collection.find(query, {"embedding": 0}).limit(limit)
+            else:
+                # This is a text query for semantic similarity search
+                return self.find_similar_cache_entries(query, limit=limit, **kwargs)
        
     def retrieve_by_id(self, id: str, memory_store_type: MemoryType) -> Optional[Dict[str, Any]]:
         """
