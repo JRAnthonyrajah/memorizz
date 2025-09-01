@@ -280,6 +280,10 @@ class MemAgent:
             
         self.agent_id = agent_id
         
+        # Conversation ID persistence: Store current conversation_id to reuse across runs
+        # This fixes the issue where each run() generates a new conversation_id
+        self._current_conversation_id = None
+        
         # Update semantic cache with agent ID and memory ID if enabled
         if self.semantic_cache_instance:
             self.semantic_cache_instance.agent_id = self.agent_id
@@ -989,10 +993,19 @@ class MemAgent:
             if hasattr(self.memory_provider, "update_memagent_memory_ids"):
                 self.memory_provider.update_memagent_memory_ids(self.agent_id, self.memory_ids)
 
-        # 2) Ensure conversation_id
+        # 2) Ensure conversation_id with persistence
         if conversation_id is None:
-            # Use MongoDB ObjectId for better performance
-            conversation_id = str(ObjectId())
+            # Check if we already have a current conversation_id stored
+            if self._current_conversation_id:
+                # Reuse existing conversation_id to maintain conversation continuity
+                conversation_id = self._current_conversation_id
+            else:
+                # Generate new conversation_id and store it for future reuse
+                conversation_id = str(ObjectId())
+                self._current_conversation_id = conversation_id
+        else:
+            # Explicit conversation_id provided - store it as current for future runs
+            self._current_conversation_id = conversation_id
             
         return memory_id, conversation_id
 
@@ -1096,10 +1109,14 @@ class MemAgent:
         augmented_query += conversational_history_prompt
 
         # 6) Append past conversation history
-        for conv in self.load_conversation_history(memory_id):
-            augmented_query += (
-                f"\n\n{conv['role']}: {conv['content']}. "
-            )
+        conversation_history = self.load_conversation_history(memory_id)
+        logger.debug(f"Loaded {len(conversation_history) if conversation_history else 0} conversation history items for memory_id: {memory_id}")
+        
+        if conversation_history:
+            for conv in conversation_history:
+                augmented_query += (
+                    f"\n\n{conv['role']}: {conv['content']}. "
+                )
         
         return augmented_query
 
@@ -1485,6 +1502,19 @@ class MemAgent:
             memory_id = self.memory_ids[-1]
 
         return self.memory_unit.retrieve_memory_units_by_memory_id(memory_id, MemoryType.CONVERSATION_MEMORY)
+
+    def start_new_conversation(self):
+        """
+        Start a new conversation by clearing the current conversation ID.
+        
+        The next run() call will generate a new conversation_id and subsequent
+        calls will reuse that new ID, maintaining conversation continuity.
+        
+        Returns:
+            str: The new conversation_id that will be generated on next run()
+        """
+        self._current_conversation_id = None
+        return "New conversation will start on next run()"
 
     def _load_relevant_memory_units(self, query: str, memory_type: MemoryType, memory_id: str = None, limit: int = 5):
         """

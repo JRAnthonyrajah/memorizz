@@ -316,6 +316,9 @@ class MongoDBProvider(MemoryProvider):
             # Remove agent_id from the removal list to preserve it (we used this for scoped agents semantic cache)
             custom_id_fields = [field for field in custom_id_fields if field != "agent_id"]
             # Don't add memory_id to removal list for semantic cache
+        elif memory_store_type == MemoryType.CONVERSATION_MEMORY:
+            # Don't remove memory_id for conversation memory as it's needed for conversation history retrieval
+            pass  # Keep memory_id for conversation memory
         else:
             # For all other memory types, remove memory_id as before
             custom_id_fields.append("memory_id")
@@ -1165,7 +1168,9 @@ class MongoDBProvider(MemoryProvider):
             The conversation history ordered by timestamp.
         """
         projection = {} if include_embedding else {"embedding": 0}
-        return list(self.conversation_memory_collection.find({"memory_id": memory_id}, projection).sort("timestamp", 1))
+        results = list(self.conversation_memory_collection.find({"memory_id": memory_id}, projection).sort("timestamp", 1))
+        logger.debug(f"Retrieved {len(results)} conversation items for memory_id: {memory_id}")
+        return results
     
     def retrieve_memory_units_by_query(self, query: str = None, query_embedding: list[float] = None, memory_id: str = None, memory_type: MemoryType = None, limit: int = 5) -> List[Dict[str, Any]]:
         """
