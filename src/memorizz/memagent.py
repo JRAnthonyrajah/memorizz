@@ -17,6 +17,7 @@ from .memory_unit import MemoryUnit
 from .long_term_memory.episodic.conversational_memory_unit import ConversationMemoryUnit
 from .enums import Role, ApplicationMode, ApplicationModeConfig, MemoryType
 from .short_term_memory.working_memory.cwm import CWM
+from .short_term_memory.semantic_cache import SemanticCache, SemanticCacheConfig
 from .long_term_memory.semantic.knowledge_base import KnowledgeBase
 from .long_term_memory.procedural.workflow.workflow import Workflow, WorkflowOutcome
 from .long_term_memory.procedural.toolbox.toolbox import Toolbox
@@ -26,7 +27,7 @@ from .embeddings import configure_embeddings
 from typing import Callable
 
 # Configure logging based on environment variable
-MEMORIZZ_LOG_LEVEL = os.getenv('MEMORIZZ_LOG_LEVEL', 'WARNING').upper()
+MEMORIZZ_LOG_LEVEL = os.getenv('MEMORIZZ_LOG_LEVEL', 'DEBUG').upper()
 logger = logging.getLogger(__name__)
 
 # Set package-wide logging level
@@ -53,6 +54,8 @@ class MemAgentModel(BaseModel):
     long_term_memory_ids: Optional[List[str]] = None
     delegates: Optional[List[str]] = None  # Store delegate agent IDs
     embedding_config: Optional[Dict[str, Any]] = None
+    semantic_cache: Optional[bool] = False  # Enable semantic cache
+    semantic_cache_config: Optional[Union[SemanticCacheConfig, Dict[str, Any]]] = None  # Semantic cache configuration
     
     model_config = {
         "arbitrary_types_allowed": True  # Allow arbitrary types like Toolbox
@@ -77,7 +80,9 @@ class MemAgent:
         delegates: Optional[List['MemAgent']] = None, # Delegate agents for multi-agent mode
         verbose: bool = None, # Control logging verbosity (None=use env var, True=INFO, False=WARNING)
         embedding_provider: Optional[str] = None, # Embedding provider to use (openai, ollama)
-        embedding_config: Optional[Dict[str, Any]] = None # Configuration for the embedding provider
+        embedding_config: Optional[Dict[str, Any]] = None, # Configuration for the embedding provider
+        semantic_cache: bool = False, # Enable semantic cache for query-response caching
+        semantic_cache_config: Optional[Union[SemanticCacheConfig, Dict[str, Any]]] = None # Configuration for semantic cache
     ):
         # If the memory provider is not provided, then we use the default memory provider
         if memory_provider is None:
@@ -136,6 +141,80 @@ class MemAgent:
             # Use default memory types from application mode
             self.active_memory_types = ApplicationModeConfig.get_memory_types(self.application_mode)
             logger.info(f"Using application mode '{self.application_mode.value}' with memory types: {[mt.value for mt in self.active_memory_types]}")
+
+        # Initialize semantic cache if enabled
+        self.semantic_cache_instance = None
+        if semantic_cache:
+            # Handle both dictionary and SemanticCacheConfig inputs
+            if semantic_cache_config:
+                if isinstance(semantic_cache_config, dict):
+                    # Convert dictionary to SemanticCacheConfig with validation
+                    try:
+                        # Merge agent's embedding settings with provided config
+                        config_dict = semantic_cache_config.copy()
+                        if embedding_provider:
+                            config_dict['embedding_provider'] = embedding_provider
+                            logger.debug(f"Forcing semantic cache to use agent's embedding_provider: {embedding_provider}")
+                        if embedding_config:
+                            config_dict['embedding_config'] = embedding_config
+                            logger.debug(f"Forcing semantic cache to use agent's embedding_config: {embedding_config}")
+                        
+                        # Handle string scope values in dictionary
+                        if 'scope' in config_dict and isinstance(config_dict['scope'], str):
+                            from .enums.semantic_cache_scope import SemanticCacheScope
+                            scope_str = config_dict['scope'].lower()
+                            if scope_str == 'local':
+                                config_dict['scope'] = SemanticCacheScope.LOCAL
+                            elif scope_str == 'global':
+                                config_dict['scope'] = SemanticCacheScope.GLOBAL
+                            else:
+                                logger.warning(f"Invalid scope value '{config_dict['scope']}', using default LOCAL")
+                                config_dict['scope'] = SemanticCacheScope.LOCAL
+                        
+                        config = SemanticCacheConfig(**config_dict)
+                        logger.debug("Successfully converted dictionary to SemanticCacheConfig")
+                    except Exception as e:
+                        logger.error(f"Failed to create SemanticCacheConfig from dictionary: {e}")
+                        logger.info("Using default config with agent's embedding settings")
+                        config = SemanticCacheConfig(
+                            embedding_provider=embedding_provider,
+                            embedding_config=embedding_config
+                        )
+                else:
+                    # Already a SemanticCacheConfig object
+                    config = semantic_cache_config
+                    # IMPORTANT: Always use the agent's embedding configuration for consistency
+                    # Override any embedding settings in config to ensure consistency
+                    if embedding_provider:
+                        config.embedding_provider = embedding_provider
+                        logger.debug(f"Forcing semantic cache to use agent's embedding_provider: {embedding_provider}")
+                    if embedding_config:
+                        config.embedding_config = embedding_config
+                        logger.debug(f"Forcing semantic cache to use agent's embedding_config: {embedding_config}")
+            else:
+                # Create default config with agent's embedding settings
+                config = SemanticCacheConfig(
+                    embedding_provider=embedding_provider,
+                    embedding_config=embedding_config
+                )
+            
+            # Pass the global embedding manager to ensure perfect consistency
+            embedding_manager = None
+            try:
+                from .embeddings import get_embedding_manager
+                embedding_manager = get_embedding_manager()
+                logger.debug("Using global embedding manager for semantic cache consistency")
+            except Exception as e:
+                logger.warning(f"Could not get global embedding manager: {e}")
+            
+            self.semantic_cache_instance = SemanticCache(
+                config=config,
+                memory_provider=self.memory_provider,
+                embedding_manager=embedding_manager,  # Use same embedding manager as agent
+                agent_id=None,  # Will be set after agent_id is established
+                memory_id=None  # Will be set if memory_ids are established
+            )
+            logger.info(f"SemanticCache enabled with agent's embedding config for consistency")
 
         # Initialize the model - honor caller's model if provided, else use default
         # This allows users to specify their own model configuration
@@ -209,6 +288,18 @@ class MemAgent:
             self.memory_ids = memory_ids
             
         self.agent_id = agent_id
+        
+        # Conversation ID persistence: Store current conversation_id to reuse across runs
+        # This fixes the issue where each run() generates a new conversation_id
+        self._current_conversation_id = None
+        
+        # Update semantic cache with agent ID and memory ID if enabled
+        if self.semantic_cache_instance:
+            self.semantic_cache_instance.agent_id = self.agent_id
+            # Use the first memory_id if available for cache scoping
+            if self.memory_ids:
+                self.semantic_cache_instance.memory_id = self.memory_ids[0]
+                logger.debug(f"SemanticCache configured with agent_id={self.agent_id}, memory_id={self.memory_ids[0]}")
 
         # If tools is a Toolbox, properly initialize it using the same logic as add_tool
         if isinstance(tools, Toolbox):
@@ -809,24 +900,72 @@ class MemAgent:
             # 1) Prepare memory and conversation IDs
             memory_id, conversation_id = self._prepare_memory_and_ids(memory_id, conversation_id)
             
-            # 2) Build the complete augmented query with context
+            # 2) Check semantic cache for similar queries (if enabled)
+            logger.debug(f"Semantic cache instance available: {self.semantic_cache_instance is not None}")
+            if self.semantic_cache_instance:
+                logger.debug(f"Checking semantic cache for query: {query[:50]}...")
+                logger.debug(f"Cache context - session_id: {conversation_id}, agent_id: {self.semantic_cache_instance.agent_id}, memory_id: {self.semantic_cache_instance.memory_id}")
+                
+                cached_response = self.semantic_cache_instance.get(
+                    query=query,
+                    session_id=conversation_id
+                )
+                
+                logger.debug(f"Semantic cache result: {'HIT' if cached_response else 'MISS'}")
+                if cached_response:
+
+                    
+                    # Record user's query in memory before returning cached response
+                    self._record_user_query(query, conversation_id, memory_id)
+                    
+                    # Record the cached response as assistant response in conversation memory
+                    if MemoryType.CONVERSATION_MEMORY in self.active_memory_types:
+                        logger.info(f"Recording cached assistant response to memory - memory_id: {memory_id}, conversation_id: {conversation_id}")
+                        memory_unit = self._generate_conversational_memory_unit({
+                            "role": Role.ASSISTANT,
+                            "content": cached_response,
+                            "timestamp": datetime.now().isoformat(),
+                            "conversation_id": conversation_id,
+                            "memory_id": memory_id,
+                        })
+                        logger.debug(f"Created cached response memory unit: {memory_unit}")
+                    else:
+                        logger.warning(f"CONVERSATION_MEMORY not in active memory types: {self.active_memory_types}")
+                    
+                    return cached_response
+            
+            # 3) Build the complete augmented query with context
             augmented_query = self._build_augmented_query(query, memory_id)
             
-            # 3) Generate system prompt and create initial messages
+            # 4) Generate system prompt and create initial messages
             system_prompt = self._generate_system_prompt()
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": augmented_query},
             ]
             
-            # 4) Log debug information
+            # 5) Log debug information
             self._log_prompt_debug_info(system_prompt, augmented_query)
             
-            # 5) Record user's query in memory
+            # 6) Record user's query in memory
             self._record_user_query(query, conversation_id, memory_id)
             
-            # 6) Execute main interaction loop
+            # 7) Execute main interaction loop
             final_response = self._execute_main_loop(messages, query, memory_id, conversation_id)
+            
+            # 8) Cache the response for future similar queries (if semantic cache enabled)
+            if self.semantic_cache_instance:
+                self.semantic_cache_instance.set(
+                    query=query,
+                    response=final_response,
+                    session_id=conversation_id,
+                    metadata={
+                        'memory_id': memory_id,
+                        'agent_id': self.agent_id,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                )
+                logger.debug(f"SEMANTIC CACHE STORE: Cached response for query: {query[:50]}...")
             
             return final_response
             
@@ -863,10 +1002,19 @@ class MemAgent:
             if hasattr(self.memory_provider, "update_memagent_memory_ids"):
                 self.memory_provider.update_memagent_memory_ids(self.agent_id, self.memory_ids)
 
-        # 2) Ensure conversation_id
+        # 2) Ensure conversation_id with persistence
         if conversation_id is None:
-            # Use MongoDB ObjectId for better performance
-            conversation_id = str(ObjectId())
+            # Check if we already have a current conversation_id stored
+            if self._current_conversation_id:
+                # Reuse existing conversation_id to maintain conversation continuity
+                conversation_id = self._current_conversation_id
+            else:
+                # Generate new conversation_id and store it for future reuse
+                conversation_id = str(ObjectId())
+                self._current_conversation_id = conversation_id
+        else:
+            # Explicit conversation_id provided - store it as current for future runs
+            self._current_conversation_id = conversation_id
             
         return memory_id, conversation_id
 
@@ -970,10 +1118,14 @@ class MemAgent:
         augmented_query += conversational_history_prompt
 
         # 6) Append past conversation history
-        for conv in self.load_conversation_history(memory_id):
-            augmented_query += (
-                f"\n\n{conv['role']}: {conv['content']}. "
-            )
+        conversation_history = self.load_conversation_history(memory_id)
+        logger.debug(f"Loaded {len(conversation_history) if conversation_history else 0} conversation history items for memory_id: {memory_id}")
+        
+        if conversation_history:
+            for conv in conversation_history:
+                augmented_query += (
+                    f"\n\n{conv['role']}: {conv['content']}. "
+                )
         
         return augmented_query
 
@@ -1360,6 +1512,19 @@ class MemAgent:
 
         return self.memory_unit.retrieve_memory_units_by_memory_id(memory_id, MemoryType.CONVERSATION_MEMORY)
 
+    def start_new_conversation(self):
+        """
+        Start a new conversation by clearing the current conversation ID.
+        
+        The next run() call will generate a new conversation_id and subsequent
+        calls will reuse that new ID, maintaining conversation continuity.
+        
+        Returns:
+            str: The new conversation_id that will be generated on next run()
+        """
+        self._current_conversation_id = None
+        return "New conversation will start on next run()"
+
     def _load_relevant_memory_units(self, query: str, memory_type: MemoryType, memory_id: str = None, limit: int = 5):
         """
         Load the relevant memory units.
@@ -1456,6 +1621,16 @@ class MemAgent:
             logger.warning("Embedding config is None, attempting to refresh...")
             self.refresh_embedding_config()
             
+        # Prepare semantic_cache_config for serialization
+        semantic_cache_config_to_save = None
+        if hasattr(self, 'semantic_cache_instance') and self.semantic_cache_instance:
+            # Convert SemanticCacheConfig to dict for storage
+            if hasattr(self.semantic_cache_instance, 'config'):
+                semantic_cache_config_to_save = self.semantic_cache_instance.config.__dict__.copy()
+                # Convert enum to string for JSON serialization
+                if 'scope' in semantic_cache_config_to_save:
+                    semantic_cache_config_to_save['scope'] = semantic_cache_config_to_save['scope'].value
+        
         # Create a new MemAgentModel with the current object's attributes
         memagent_to_save = MemAgentModel(
             llm_config=self.model.get_config() if self.model else None, # ✅ Correctly saves model config
@@ -1469,7 +1644,9 @@ class MemAgent:
             tools=tools_to_save,
             long_term_memory_ids=getattr(self, "long_term_memory_ids", None),
             delegates=delegate_ids if delegate_ids else None,
-            embedding_config=self.embedding_config
+            embedding_config=self.embedding_config,
+            semantic_cache=bool(getattr(self, 'semantic_cache_instance', None)),
+            semantic_cache_config=semantic_cache_config_to_save
         )
 
         # Check if this is a new agent or an existing one
@@ -1478,6 +1655,13 @@ class MemAgent:
             saved_memagent = self.memory_provider.store_memagent(memagent_to_save)
             # Update the agent_id to the MongoDB _id that was generated
             self.agent_id = str(saved_memagent["_id"])
+            
+            # Update semantic cache with the newly generated agent_id
+            if self.semantic_cache_instance:
+                self.semantic_cache_instance.agent_id = self.agent_id
+                if self.memory_ids:
+                    self.semantic_cache_instance.memory_id = self.memory_ids[0]
+                logger.debug(f"Updated SemanticCache with agent_id={self.agent_id}")
         else:
             # Existing agent - update it
             saved_memagent = self.memory_provider.update_memagent(memagent_to_save)
@@ -1495,59 +1679,56 @@ class MemAgent:
 
     def _extract_embedding_config(self) -> Optional[Dict[str, Any]]:
         """Extract embedding configuration with proper priority: direct > memory_provider > global."""
-        logger.info("🔍 EXTRACTION START: _extract_embedding_config called")
+        logger.debug("Extracting embedding configuration")
         
         # Priority 1: Direct MemAgent parameters
-        logger.info(f"🔍 PRIORITY 1: Checking direct embedding provider: {getattr(self, '_direct_embedding_provider', None)}")
         if getattr(self, '_direct_embedding_provider', None) is not None:
             result = {
                 "provider": self._direct_embedding_provider,
                 "config": getattr(self, '_direct_embedding_config', {}) or {}
             }
-            logger.info(f"✅ PRIORITY 1 SUCCESS: Extracted direct embedding config: {result}")
+            logger.debug(f"Using direct embedding config: {result}")
             return result
-        logger.info("❌ PRIORITY 1 SKIP: No direct embedding provider")
         
         # Priority 2: Memory provider configuration (MongoDB provider)
-        logger.info(f"🔍 PRIORITY 2: Checking memory provider: {type(self.memory_provider).__name__}")
-        logger.info(f"🔍 PRIORITY 2: Memory provider has _embedding_provider: {hasattr(self.memory_provider, '_embedding_provider')}")
+        logger.debug(f"Checking memory provider for embedding config: {type(self.memory_provider).__name__}")
         
         try:
             # Check if memory provider has the processed embedding provider (MongoDBProvider case)
             if hasattr(self.memory_provider, '_embedding_provider'):
                 processed_provider = getattr(self.memory_provider, '_embedding_provider')
-                logger.info(f"🔍 PRIORITY 2: Processed provider type: {type(processed_provider)}")
-                logger.info(f"🔍 PRIORITY 2: Processed provider is None: {processed_provider is None}")
+                logger.info(f" PRIORITY 2: Processed provider type: {type(processed_provider)}")
+                logger.info(f" PRIORITY 2: Processed provider is None: {processed_provider is None}")
                 
                 if processed_provider is not None:
-                    logger.info(f"🔍 PRIORITY 2: Provider has get_provider_info: {hasattr(processed_provider, 'get_provider_info')}")
+                    logger.info(f" PRIORITY 2: Provider has get_provider_info: {hasattr(processed_provider, 'get_provider_info')}")
                     
                     if hasattr(processed_provider, 'get_provider_info'):
                         # It's an EmbeddingManager instance
                         try:
                             provider_type = getattr(processed_provider, 'provider_type', None)
                             config = getattr(processed_provider, 'config', {}) or {}
-                            logger.info(f"🔍 PRIORITY 2: Provider type: {provider_type}")
-                            logger.info(f"🔍 PRIORITY 2: Provider config: {config}")
+                            logger.info(f" PRIORITY 2: Provider type: {provider_type}")
+                            logger.info(f" PRIORITY 2: Provider config: {config}")
                             
                             result = {
                                 "provider": provider_type.value if hasattr(provider_type, 'value') else str(provider_type),
                                 "config": config
                             }
-                            logger.info(f"✅ PRIORITY 2 SUCCESS: Extracted from processed embedding provider: {result}")
+                            logger.info(f" PRIORITY 2 SUCCESS: Extracted from processed embedding provider: {result}")
                             return result
                         except Exception as e:
-                            logger.error(f"❌ PRIORITY 2 ERROR: Failed to extract from processed EmbeddingManager: {e}")
+                            logger.error(f" PRIORITY 2 ERROR: Failed to extract from processed EmbeddingManager: {e}")
                             import traceback
-                            logger.error(f"❌ PRIORITY 2 TRACEBACK: {traceback.format_exc()}")
+                            logger.error(f" PRIORITY 2 TRACEBACK: {traceback.format_exc()}")
                 else:
-                    logger.info("❌ PRIORITY 2 SKIP: Processed provider is None")
+                    logger.info(" PRIORITY 2 SKIP: Processed provider is None")
             else:
-                logger.info("❌ PRIORITY 2 SKIP: Memory provider has no _embedding_provider")
+                logger.info(" PRIORITY 2 SKIP: Memory provider has no _embedding_provider")
             
             # Fallback to original config-based approach
-            logger.info(f"🔍 PRIORITY 2 FALLBACK: Checking config-based approach")
-            logger.info(f"🔍 PRIORITY 2 FALLBACK: Has config: {hasattr(self.memory_provider, 'config')}")
+            logger.info(f" PRIORITY 2 FALLBACK: Checking config-based approach")
+            logger.info(f" PRIORITY 2 FALLBACK: Has config: {hasattr(self.memory_provider, 'config')}")
             
             if (hasattr(self.memory_provider, 'config') and 
                 self.memory_provider.config is not None and
@@ -1555,13 +1736,13 @@ class MemAgent:
                 
                 provider = self.memory_provider.config.embedding_provider
                 config = getattr(self.memory_provider.config, 'embedding_config', {}) or {}
-                logger.info(f"🔍 PRIORITY 2 FALLBACK: Config provider: {provider}")
-                logger.info(f"🔍 PRIORITY 2 FALLBACK: Config config: {config}")
+                logger.info(f" PRIORITY 2 FALLBACK: Config provider: {provider}")
+                logger.info(f" PRIORITY 2 FALLBACK: Config config: {config}")
                 
                 if provider is not None:
                     if isinstance(provider, str):
                         result = {"provider": provider, "config": config}
-                        logger.info(f"✅ PRIORITY 2 FALLBACK SUCCESS: Extracted memory provider string config: {result}")
+                        logger.info(f" PRIORITY 2 FALLBACK SUCCESS: Extracted memory provider string config: {result}")
                         return result
                     elif hasattr(provider, 'get_provider_info'):
                         try:
@@ -1569,42 +1750,42 @@ class MemAgent:
                                 "provider": provider.provider_type.value if hasattr(provider, 'provider_type') else str(provider),
                                 "config": getattr(provider, 'config', {}) or {}
                             }
-                            logger.info(f"✅ PRIORITY 2 FALLBACK SUCCESS: Extracted memory provider manager config: {result}")
+                            logger.info(f" PRIORITY 2 FALLBACK SUCCESS: Extracted memory provider manager config: {result}")
                             return result
                         except Exception as e:
-                            logger.error(f"❌ PRIORITY 2 FALLBACK ERROR: Failed to extract from EmbeddingManager: {e}")
+                            logger.error(f" PRIORITY 2 FALLBACK ERROR: Failed to extract from EmbeddingManager: {e}")
                 else:
-                    logger.info("❌ PRIORITY 2 FALLBACK SKIP: Memory provider embedding_provider is None")
+                    logger.info(" PRIORITY 2 FALLBACK SKIP: Memory provider embedding_provider is None")
             else:
-                logger.info(f"❌ PRIORITY 2 FALLBACK SKIP: Config check failed")
+                logger.info(f" PRIORITY 2 FALLBACK SKIP: Config check failed")
         except Exception as e:
-            logger.error(f"❌ PRIORITY 2 ERROR: Error extracting from memory provider: {e}")
+            logger.error(f" PRIORITY 2 ERROR: Error extracting from memory provider: {e}")
             import traceback
-            logger.error(f"❌ PRIORITY 2 TRACEBACK: {traceback.format_exc()}")
+            logger.error(f" PRIORITY 2 TRACEBACK: {traceback.format_exc()}")
         
         # Priority 3: Global embedding manager (with better error handling)
-        logger.info("🔍 PRIORITY 3: Checking global embedding manager")
+        logger.info(" PRIORITY 3: Checking global embedding manager")
         try:
             from .embeddings import get_embedding_manager
             manager = get_embedding_manager()
-            logger.info(f"🔍 PRIORITY 3: Global manager type: {type(manager)}")
-            logger.info(f"🔍 PRIORITY 3: Global manager is None: {manager is None}")
+            logger.info(f" PRIORITY 3: Global manager type: {type(manager)}")
+            logger.info(f" PRIORITY 3: Global manager is None: {manager is None}")
             
             if manager and hasattr(manager, 'provider_type') and hasattr(manager, 'config'):
                 result = {
                     "provider": manager.provider_type.value,
                     "config": manager.config or {}
                 }
-                logger.info(f"✅ PRIORITY 3 SUCCESS: Extracted global embedding config: {result}")
+                logger.info(f" PRIORITY 3 SUCCESS: Extracted global embedding config: {result}")
                 return result
             else:
-                logger.warning("❌ PRIORITY 3 SKIP: Global embedding manager is invalid or incomplete")
+                logger.warning(" PRIORITY 3 SKIP: Global embedding manager is invalid or incomplete")
         except Exception as e:
-            logger.error(f"❌ PRIORITY 3 ERROR: Failed to get global embedding manager: {e}")
+            logger.error(f" PRIORITY 3 ERROR: Failed to get global embedding manager: {e}")
             import traceback
-            logger.error(f"❌ PRIORITY 3 TRACEBACK: {traceback.format_exc()}")
+            logger.error(f" PRIORITY 3 TRACEBACK: {traceback.format_exc()}")
         
-        logger.error("❌ EXTRACTION FAILED: Could not extract embedding config from any source")
+        logger.error(" EXTRACTION FAILED: Could not extract embedding config from any source")
         return None
 
     def get_stored_embedding_config(self) -> Optional[Dict[str, Any]]:
@@ -1813,6 +1994,30 @@ class MemAgent:
                 except Exception as e:
                     logger.warning(f"Could not load delegate agent {delegate_id}: {e}")
 
+        # Handle semantic_cache_config reconstruction
+        semantic_cache_config_to_load = None
+        if hasattr(memagent, "semantic_cache_config") and memagent.semantic_cache_config:
+            # Convert the stored dict back to SemanticCacheConfig
+            try:
+                config_dict = dict(memagent.semantic_cache_config)
+                # Convert string scope back to enum if present
+                if 'scope' in config_dict and isinstance(config_dict['scope'], str):
+                    from .enums.semantic_cache_scope import SemanticCacheScope
+                    scope_str = config_dict['scope'].lower()
+                    if scope_str == 'local':
+                        config_dict['scope'] = SemanticCacheScope.LOCAL
+                    elif scope_str == 'global':
+                        config_dict['scope'] = SemanticCacheScope.GLOBAL
+                    else:
+                        logger.warning(f"Unknown scope value '{config_dict['scope']}', using LOCAL")
+                        config_dict['scope'] = SemanticCacheScope.LOCAL
+                
+                semantic_cache_config_to_load = SemanticCacheConfig(**config_dict)
+                logger.debug("Successfully reconstructed SemanticCacheConfig from stored data")
+            except Exception as e:
+                logger.warning(f"Failed to reconstruct SemanticCacheConfig: {e}")
+                semantic_cache_config_to_load = None
+
         # Instantiate with saved parameters (and allow callers to override e.g. model)
         agent_instance = cls(
             model=overrides.get("model", model_to_load),
@@ -1825,7 +2030,9 @@ class MemAgent:
             memory_ids=overrides.get("memory_ids", getattr(memagent, "memory_ids", [])),
             agent_id=agent_id,
             memory_provider=provider,
-            delegates=overrides.get("delegates", loaded_delegates)  # Include loaded delegates
+            delegates=overrides.get("delegates", loaded_delegates),  # Include loaded delegates
+            semantic_cache=overrides.get("semantic_cache", getattr(memagent, "semantic_cache", False)),
+            semantic_cache_config=overrides.get("semantic_cache_config", semantic_cache_config_to_load)
         )
         
         # Set long_term_memory_ids if they exist

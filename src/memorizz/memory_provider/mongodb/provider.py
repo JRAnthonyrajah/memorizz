@@ -8,7 +8,7 @@ from ...enums.memory_type import MemoryType
 from ...memagent import MemAgentModel
 from ...long_term_memory.semantic.persona.persona import Persona
 from ...long_term_memory.semantic.persona.role_type import RoleType
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from pymongo.operations import SearchIndexModel
 from ...embeddings import get_embedding, get_embedding_dimensions
 
@@ -76,6 +76,7 @@ class MongoDBProvider(MemoryProvider):
         self.memagent_collection = self.db[MemoryType.MEMAGENT.value]
         self.shared_memory_collection = self.db[MemoryType.SHARED_MEMORY.value]
         self.summaries_collection = self.db[MemoryType.SUMMARIES.value]
+        self.semantic_cache_collection = self.db[MemoryType.SEMANTIC_CACHE.value]
 
         # Track which vector indexes have been created
         self._vector_indexes_created = set()
@@ -226,7 +227,7 @@ class MongoDBProvider(MemoryProvider):
         for memory_store_type in MemoryType:
             if memory_store_type.value not in self.db.list_collection_names():
                 self.db.create_collection(memory_store_type.value)
-                print(f"Created collection: {memory_store_type.value} successfully.")
+
         
 
     def _create_vector_indexes_for_memory_stores(self) -> None:
@@ -241,12 +242,16 @@ class MongoDBProvider(MemoryProvider):
         for memory_store_type in MemoryType:
             # PERSONAS collection doesn't need memory_id filter since it's not memory-scoped
             memory_store_present = memory_store_type != MemoryType.PERSONAS
-
-            self._ensure_vector_index(
-                collection=self.db[memory_store_type.value],
-                index_name="vector_index",
-                memory_store=memory_store_present,
-            )
+            
+            # Semantic cache needs special handling due to different field name
+            if memory_store_type == MemoryType.SEMANTIC_CACHE:
+                self._ensure_semantic_cache_vector_index()
+            else:
+                self._ensure_vector_index(
+                    collection=self.db[memory_store_type.value],
+                    index_name="vector_index",
+                    memory_store=memory_store_present,
+                )
             
     def store(self, data: Dict[str, Any], memory_store_type: MemoryType) -> str:
         """
@@ -282,6 +287,8 @@ class MongoDBProvider(MemoryProvider):
             collection = self.shared_memory_collection
         elif memory_store_type == MemoryType.SUMMARIES:
             collection = self.summaries_collection
+        elif memory_store_type == MemoryType.SEMANTIC_CACHE:
+            collection = self.semantic_cache_collection
 
         if collection is None:
             raise ValueError(f"Invalid memory store type: {memory_store_type}")
@@ -303,6 +310,18 @@ class MongoDBProvider(MemoryProvider):
         # Don't remove long_term_memory_id for long-term memory as it's needed for knowledge linking
         if memory_store_type != MemoryType.LONG_TERM_MEMORY:
             custom_id_fields.append("long_term_memory_id")
+        
+        # Don't remove agent_id and memory_id for semantic cache as they're needed for filtering and scoping
+        if memory_store_type == MemoryType.SEMANTIC_CACHE:
+            # Remove agent_id from the removal list to preserve it (we used this for scoped agents semantic cache)
+            custom_id_fields = [field for field in custom_id_fields if field != "agent_id"]
+            # Don't add memory_id to removal list for semantic cache
+        elif memory_store_type == MemoryType.CONVERSATION_MEMORY:
+            # Don't remove memory_id for conversation memory as it's needed for conversation history retrieval
+            pass  # Keep memory_id for conversation memory
+        else:
+            # For all other memory types, remove memory_id as before
+            custom_id_fields.append("memory_id")
             
         for field in custom_id_fields:
             data_copy.pop(field, None)
@@ -320,14 +339,15 @@ class MongoDBProvider(MemoryProvider):
             result = collection.insert_one(data_copy)
             return str(result.inserted_id)
 
-    def retrieve_by_query(self, query: Dict[str, Any], memory_store_type: MemoryType, limit: int = 1, include_embedding: bool = False) -> Optional[Dict[str, Any]]:
+    def retrieve_by_query(self, query: Union[Dict[str, Any], str], memory_store_type: MemoryType, limit: int = 1, include_embedding: bool = False, **kwargs) -> Optional[Dict[str, Any]]:
         """
         Retrieve a document from MongoDB.
         
         Parameters:
         -----------
-        query : Dict[str, Any]
-            The query to use for retrieval.
+        query : Union[Dict[str, Any], str]
+            The query to use for retrieval. For semantic cache, this is a string (search text).
+            For other memory types, this is a MongoDB query dict.
         limit : int
             The maximum number of documents to return.
         include_embedding : bool
@@ -338,6 +358,8 @@ class MongoDBProvider(MemoryProvider):
         Optional[Dict[str, Any]]
             The retrieved document, or None if not found.
         """
+
+
         
         # Define projection to exclude embeddings by default
         projection = {} if include_embedding else {"embedding": 0}
@@ -356,6 +378,16 @@ class MongoDBProvider(MemoryProvider):
             return self.conversation_memory_collection.find(query, projection).limit(limit)
         elif memory_store_type == MemoryType.SUMMARIES:
             return self.retrieve_summaries_by_query(query, limit)
+        elif memory_store_type == MemoryType.SEMANTIC_CACHE:
+            # For semantic cache, we need to handle two different cases:
+            # 1. Dict query: Loading existing cache entries (e.g., {"agent_id": "xyz"})
+            # 2. String query: Semantic similarity search (e.g., "What is Python?")
+            if isinstance(query, dict):
+                # This is a filter query for loading existing cache entries
+                return self.semantic_cache_collection.find(query, {"embedding": 0}).limit(limit)
+            else:
+                # This is a text query for semantic similarity search
+                return self.find_similar_cache_entries(query, limit=limit, **kwargs)
        
     def retrieve_by_id(self, id: str, memory_store_type: MemoryType) -> Optional[Dict[str, Any]]:
         """
@@ -382,7 +414,8 @@ class MongoDBProvider(MemoryProvider):
             MemoryType.LONG_TERM_MEMORY: self.long_term_memory_collection,
             MemoryType.CONVERSATION_MEMORY: self.conversation_memory_collection,
             MemoryType.SHARED_MEMORY: self.shared_memory_collection,
-            MemoryType.SUMMARIES: self.summaries_collection
+            MemoryType.SUMMARIES: self.summaries_collection,
+            MemoryType.SEMANTIC_CACHE: self.semantic_cache_collection
         }
         
         collection = collection_mapping.get(memory_store_type)
@@ -393,6 +426,10 @@ class MongoDBProvider(MemoryProvider):
         projection = {"embedding": 0} if memory_store_type in [
             MemoryType.PERSONAS, MemoryType.TOOLBOX, MemoryType.WORKFLOW_MEMORY, MemoryType.SUMMARIES
         ] else None
+        
+        # For semantic cache, exclude embedding by default for performance
+        if memory_store_type == MemoryType.SEMANTIC_CACHE:
+            projection = {"embedding": 0}
         
         # Retrieve using MongoDB _id only
         try:
@@ -457,7 +494,11 @@ class MongoDBProvider(MemoryProvider):
         """
 
         # Get the embedding for the query
-        embedding = get_embedding(query)
+        try:
+            embedding = get_embedding(query)
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for query: {e}")
+            return []
 
         # Create the vector search pipeline
         pipeline = [
@@ -504,7 +545,11 @@ class MongoDBProvider(MemoryProvider):
         """
 
         # Get the embedding for the query
-        embedding = get_embedding(query)
+        try:
+            embedding = get_embedding(query)
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for query: {e}")
+            return []
 
         # Create the vector search pipeline
         pipeline = [
@@ -551,7 +596,11 @@ class MongoDBProvider(MemoryProvider):
         """
 
         # Get the embedding for the query
-        embedding = get_embedding(query)
+        try:
+            embedding = get_embedding(query)
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for query: {e}")
+            return []
 
         # Create the vector search pipeline
         pipeline = [
@@ -596,7 +645,11 @@ class MongoDBProvider(MemoryProvider):
             The retrieved summaries, or None if not found.
         """
         # Get the embedding for the query
-        embedding = get_embedding(query)
+        try:
+            embedding = get_embedding(query)
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for query: {e}")
+            return []
 
         # Create the vector search pipeline
         pipeline = [
@@ -715,6 +768,159 @@ class MongoDBProvider(MemoryProvider):
             "created_at": {"$gte": start_time, "$lte": end_time}
         }, {"embedding": 0}).sort("created_at", -1))
 
+    # ===== SEMANTIC CACHE METHODS =====
+    
+    def store_semantic_cache_entry(self, cache_entry: Dict[str, Any]) -> str:
+        """
+        Store a semantic cache entry in the semantic_cache collection.
+        
+        Parameters:
+        -----------
+        cache_entry : Dict[str, Any]
+            The cache entry containing query, response, embedding, and metadata.
+            
+        Returns:
+        --------
+        str
+            The ID of the stored cache entry.
+        """
+        return self.store(cache_entry, MemoryType.SEMANTIC_CACHE)
+    
+    def find_similar_cache_entries(self, query: str, 
+                                  limit: int = 5, **kwargs) -> List[Dict[str, Any]]:
+        """
+        Find semantically similar cache entries using vector search.
+        
+        Parameters:
+        -----------
+        query : str
+            The query to search for
+        limit : int
+            Maximum number of results
+        kwargs : Dict[str, Any]
+            Additional filters to apply to the query
+            
+        Returns:
+        --------
+        List[Dict[str, Any]]
+            List of similar cache entries with similarity scores
+        """
+        
+        try:
+            embedding = get_embedding(query)
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for semantic cache query: {e}")
+            return []
+        
+
+        # Extract the filter from kwargs (agent_id, memory_id, session_id)
+        # Build filter conditionally - only include agent_id if present (for LOCAL scope)
+        search_filter = {}
+        if 'agent_id' in kwargs and kwargs['agent_id'] is not None:
+            search_filter['agent_id'] = str(kwargs['agent_id'])
+        if 'memory_id' in kwargs and kwargs['memory_id'] is not None:
+            search_filter['memory_id'] = str(kwargs['memory_id'])
+        if 'session_id' in kwargs and kwargs['session_id'] is not None:
+            search_filter['session_id'] = str(kwargs['session_id'])
+
+        # Get the embedding for the query
+        # Construct the vector search stage
+        vector_search_stage = {
+            "$vectorSearch": {
+                "queryVector": embedding,
+                "path": "embedding",
+                "numCandidates": 100,
+                "limit": limit,
+                "index": "vector_index"
+            }
+        }
+        
+        # Only add filter if we have any filter criteria (enables true GLOBAL scope)
+        if search_filter:
+            vector_search_stage["$vectorSearch"]["filter"] = search_filter
+
+        # Add projection stage
+        project_stage = {
+            "$project": {
+                "_id": 0,
+                "embedding": 0,
+                "score": {"$meta": "vectorSearchScore"},
+            }
+        }
+
+        pipeline = [vector_search_stage, project_stage]
+        
+        try:
+            result = self.semantic_cache_collection.aggregate(pipeline)
+            results = list(result)
+            return results
+        except Exception as e:
+            logger.warning(f"Vector search failed for semantic cache: {e}")
+            return []
+    
+    def update_cache_entry_usage(self, cache_id: str, usage_count: int, last_accessed: float) -> bool:
+        """
+        Update usage statistics for a cache entry.
+        
+        Parameters:
+        -----------
+        cache_id : str
+            The MongoDB _id of the cache entry
+        usage_count : int
+            New usage count
+        last_accessed : float
+            New last accessed timestamp
+            
+        Returns:
+        --------
+        bool
+            True if update was successful
+        """
+        try:
+            result = self.semantic_cache_collection.update_one(
+                {"_id": ObjectId(cache_id)},
+                {
+                    "$set": {
+                        "usage_count": usage_count,
+                        "last_accessed": last_accessed
+                    }
+                }
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.warning(f"Failed to update cache entry usage: {e}")
+            return False
+    
+    def clear_semantic_cache(self, agent_id: Optional[str] = None, 
+                           memory_id: Optional[str] = None) -> int:
+        """
+        Clear semantic cache entries with optional filtering.
+        
+        Parameters:
+        -----------
+        agent_id : Optional[str]
+            Clear only entries for this agent ID
+        memory_id : Optional[str] 
+            Clear only entries for this memory ID
+            
+        Returns:
+        --------
+        int
+            Number of entries deleted
+        """
+        query = {}
+        if agent_id:
+            query['agent_id'] = agent_id
+        if memory_id:
+            query['memory_id'] = memory_id
+            
+        try:
+            result = self.semantic_cache_collection.delete_many(query)
+            return result.deleted_count
+        except Exception as e:
+            logger.warning(f"Failed to clear semantic cache: {e}")
+            return 0
+
     def delete_by_id(self, id: str, memory_store_type: MemoryType) -> bool:
         """
         Delete a document from MongoDB by _id.
@@ -740,7 +946,8 @@ class MongoDBProvider(MemoryProvider):
             MemoryType.LONG_TERM_MEMORY: self.long_term_memory_collection,
             MemoryType.CONVERSATION_MEMORY: self.conversation_memory_collection,
             MemoryType.SHARED_MEMORY: self.shared_memory_collection,
-            MemoryType.SUMMARIES: self.summaries_collection
+            MemoryType.SUMMARIES: self.summaries_collection,
+            MemoryType.SEMANTIC_CACHE: self.semantic_cache_collection
         }
         
         collection = collection_mapping.get(memory_store_type)
@@ -892,7 +1099,8 @@ class MongoDBProvider(MemoryProvider):
             MemoryType.LONG_TERM_MEMORY: self.long_term_memory_collection,
             MemoryType.CONVERSATION_MEMORY: self.conversation_memory_collection,
             MemoryType.SHARED_MEMORY: self.shared_memory_collection,
-            MemoryType.SUMMARIES: self.summaries_collection
+            MemoryType.SUMMARIES: self.summaries_collection,
+            MemoryType.SEMANTIC_CACHE: self.semantic_cache_collection
         }
         
         collection = collection_mapping.get(memory_store_type)
@@ -960,7 +1168,9 @@ class MongoDBProvider(MemoryProvider):
             The conversation history ordered by timestamp.
         """
         projection = {} if include_embedding else {"embedding": 0}
-        return list(self.conversation_memory_collection.find({"memory_id": memory_id}, projection).sort("timestamp", 1))
+        results = list(self.conversation_memory_collection.find({"memory_id": memory_id}, projection).sort("timestamp", 1))
+        logger.debug(f"Retrieved {len(results)} conversation items for memory_id: {memory_id}")
+        return results
     
     def retrieve_memory_units_by_query(self, query: str = None, query_embedding: list[float] = None, memory_id: str = None, memory_type: MemoryType = None, limit: int = 5) -> List[Dict[str, Any]]:
         """
@@ -1028,7 +1238,11 @@ class MongoDBProvider(MemoryProvider):
 
         # If the query embedding is not provided, then we create it
         if query_embedding is None and query is not None:
-            query_embedding = get_embedding(query)
+            try:
+                query_embedding = get_embedding(query)
+            except Exception as e:
+                logger.error(f"Failed to generate embedding for query: {e}")
+                return []
 
         vector_stage = {
             "$vectorSearch": {
@@ -1078,7 +1292,11 @@ class MongoDBProvider(MemoryProvider):
 
         # If the query embedding is not provided, then we create it
         if query_embedding is None and query is not None:
-            query_embedding = get_embedding(query)
+            try:
+                query_embedding = get_embedding(query)
+            except Exception as e:
+                logger.error(f"Failed to generate embedding for query: {e}")
+                return []
 
         vector_stage = {
             "$vectorSearch": {
@@ -1136,7 +1354,11 @@ class MongoDBProvider(MemoryProvider):
 
         # If the query embedding is not provided, then we create it
         if query_embedding is None and query is not None:
-            query_embedding = get_embedding(query)
+            try:
+                query_embedding = get_embedding(query)
+            except Exception as e:
+                logger.error(f"Failed to generate embedding for query: {e}")
+                return []
 
         vector_stage = {
             "$vectorSearch": {
@@ -1523,7 +1745,7 @@ class MongoDBProvider(MemoryProvider):
         # Create the new index
         try:
             result = collection.create_search_index(model=new_vector_search_index_model)
-            print(f"Creating index '{index_name}'... for collection {collection.name}")
+
             
             # Wait for the index to become queryable using polling mechanism
             self._wait_for_index_ready(collection, result, index_name)
@@ -1531,7 +1753,6 @@ class MongoDBProvider(MemoryProvider):
             return result
 
         except Exception as e:
-            print(f"Error creating new vector search index '{index_name}': {e!s}")
             return None
 
     def _wait_for_index_ready(self, collection, index_name_result, display_name="vector_index"):
@@ -1543,7 +1764,7 @@ class MongoDBProvider(MemoryProvider):
         index_name_result: The name/result returned from create_search_index
         display_name: Human-readable name for logging (default: "vector_index")
         """
-        print(f"Polling to check if the index '{index_name_result}' is ready. This may take up to a minute.")
+
         
         # Define predicate function to check if index is queryable
         predicate = lambda index: index.get("queryable") is True
@@ -1561,11 +1782,8 @@ class MongoDBProvider(MemoryProvider):
                 time.sleep(5)
                 
             except Exception as e:
-                print(f"Error checking index readiness: {e}")
                 # Continue polling even if there's an error
                 time.sleep(5)
-        
-        print(f"Index '{index_name_result}' is ready for querying in collection {collection.name}.")
         
     def _ensure_vector_index(self, collection, index_name="vector_index", memory_store: bool = False):
         """
@@ -1580,11 +1798,95 @@ class MongoDBProvider(MemoryProvider):
         has_vector_index = any(index.get("name") == index_name and index.get("type") == "vectorSearch" for index in search_indexes)
         
         if not has_vector_index:
-            print(f"Vector search index '{index_name}' not found for collection {collection.name}. Creating...")
+
             self._setup_vector_search_index(collection, index_name, memory_store)
-            print(f"Vector index '{index_name}' for {collection.name} collection is now ready for use.")
         else:
-            print(f"Vector search index '{index_name}' already exists for collection {collection.name}.")
+            pass  # Index already exists
+
+    def _ensure_semantic_cache_vector_index(self) -> None:
+        """
+        Ensure vector index exists for semantic cache collection with correct field name.
+        """
+        collection = self.semantic_cache_collection
+        index_name = "vector_index"
+        
+        # Check if vector index already exists and has correct definition
+        search_indexes = list(collection.list_search_indexes())
+        existing_index = None
+        for index in search_indexes:
+            if index.get("name") == index_name and index.get("type") == "vectorSearch":
+                existing_index = index
+                break
+        
+        # Check if index exists and has all required filter fields
+        has_correct_index = False
+        if existing_index:
+            fields = existing_index.get("definition", {}).get("fields", [])
+            filter_paths = {field.get("path") for field in fields if field.get("type") == "filter"}
+            required_filters = {"agent_id", "memory_id", "session_id"}
+            has_correct_index = required_filters.issubset(filter_paths)
+            
+        # If index exists but has wrong definition, log warning but don't recreate
+        if existing_index and not has_correct_index:
+            logger.warning(f"Vector index '{index_name}' exists but has incomplete filter definition. "
+                          f"Expected filters: agent_id, memory_id, session_id. "
+                          f"To fix this, manually drop the index in MongoDB Atlas and restart the application.")
+                
+        has_vector_index = existing_index is not None  # Use existing index even if definition is incomplete
+        
+        if not has_vector_index:
+            logger.info(f"Creating semantic cache vector index with filters: agent_id, memory_id, session_id")
+            
+            try:
+                # Get embedding dimensions
+                dimensions = self._get_embedding_dimensions_safe()
+                logger.info(f"Using embedding dimensions: {dimensions}")
+                
+                # Create vector index definition for embedding field
+                vector_index_definition = {
+                    "fields": [
+                        {
+                            "type": "vector",
+                            "path": "embedding",  # Standard embedding field name
+                            "numDimensions": dimensions,
+                            "similarity": "cosine",
+                        },
+                        {
+                            "type": "filter", 
+                            "path": "agent_id",  # Filter by agent_id
+                        },
+                        {
+                            "type": "filter", 
+                            "path": "memory_id",  # Filter by memory_id
+                        },
+                        {
+                            "type": "filter", 
+                            "path": "session_id",  # Filter by session_id
+                        }
+                    ]
+                }
+                
+                new_vector_search_index_model = SearchIndexModel(
+                    definition=vector_index_definition, 
+                    name=index_name, 
+                    type="vectorSearch"
+                )
+                
+                logger.info(f"Creating vector search index '{index_name}' for semantic cache...")
+                result = collection.create_search_index(model=new_vector_search_index_model)
+                
+                # Wait for the index to become queryable
+                logger.info(f"Waiting for index '{index_name}' to become ready...")
+                self._wait_for_index_ready(collection, result, index_name)
+                
+                logger.info(f" Vector index '{index_name}' for semantic cache is ready!")
+                return result
+                
+            except Exception as e:
+                logger.error(f" Failed to create semantic cache vector index: {e}")
+                raise RuntimeError(f"Could not create semantic cache vector index: {e}")
+        else:
+            logger.info(f" Vector index '{index_name}' already exists and has correct definition")
 
     def close(self) -> None:
         """Close the connection to MongoDB."""
