@@ -1,7 +1,10 @@
+# src/memorizz/llms/azure.py
+
 import os
 import json
 import openai
 import logging
+import inspect
 from typing import Callable, List, Optional, TYPE_CHECKING, Dict, Any
 
 from .llm_provider import LLMProvider
@@ -12,34 +15,56 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # Use TYPE_CHECKING for forward references to avoid circular imports
 if TYPE_CHECKING:
     from ..long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
-import inspect
 
-class OpenAI(LLMProvider):
+class AzureOpenAI(LLMProvider):
     """
-    A class for interacting with the OpenAI API.
+    A class for interacting with the Azure OpenAI API.
     """
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o"):
+    def __init__(
+        self, 
+        azure_endpoint: Optional[str] = None,
+        api_version: Optional[str] = None,
+        deployment_name: str = "gpt-4o"
+    ):
         """
-        Initialize the OpenAI client.
+        Initialize the Azure OpenAI client.
 
         Parameters:
         -----------
-        api_key : str
-            The API key for the OpenAI API.
-        model : str, optional
-            The model to use for the OpenAI API.
+        azure_endpoint : str, optional
+            The endpoint for the Azure OpenAI API. Defaults to env var `AZURE_OPENAI_ENDPOINT`.
+        api_version : str, optional
+            The API version for the Azure OpenAI API. Defaults to env var `OPENAI_API_VERSION`.
+        deployment_name : str, optional
+            The deployment name for the model to use. Defaults to "gpt-4o".
         """
-        if api_key is None:
-            api_key = os.getenv("OPENAI_API_KEY")
+        self._api_key = os.getenv("AZURE_OPENAI_API_KEY")
+        self.azure_endpoint = azure_endpoint or os.getenv("AZURE_OPENAI_ENDPOINT")
+        self.api_version = api_version or os.getenv("OPENAI_API_VERSION")
 
-        self.client = openai.OpenAI(api_key=api_key)
-        self.model = model
-        
+        if not all([self._api_key, self.azure_endpoint, self.api_version]):
+            raise ValueError(
+                "Azure credentials not found. Please set the AZURE_OPENAI_API_KEY, "
+                "AZURE_OPENAI_ENDPOINT, and OPENAI_API_VERSION environment variables or "
+                "pass them as arguments."
+            )
+
+        self.client = openai.AzureOpenAI(
+            api_key=self._api_key,
+            azure_endpoint=self.azure_endpoint,
+            api_version=self.api_version,
+        )
+        # In Azure, the 'model' is the deployment name.
+        self.model = deployment_name
+
     def get_config(self) -> Dict[str, Any]:
-        """Returns a serializable configuration for the OpenAI provider."""
+        """Returns a serializable configuration for the AzureOpenAI provider."""
         return {
-            "provider": "openai",
-            "model": self.model
+            "provider": "azure",
+            "deployment_name": self.model,
+            "azure_endpoint": self.azure_endpoint,
+            "api_version": self.api_version
+            # Note: We don't save the API key for security. It should be loaded from env vars.
         }
 
     def get_tool_metadata(self, func: Callable) -> Dict[str, Any]:
@@ -136,7 +161,7 @@ class OpenAI(LLMProvider):
     
     def generate_text(self, prompt: str, instructions: str = None) -> str:
         """
-        Generate text using OpenAI's API.
+        Generate text using Azure OpenAI's API.
 
         Parameters:
             prompt (str): The prompt to generate text from.

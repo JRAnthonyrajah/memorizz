@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from enum import Enum
 from pydantic import BaseModel
 from bson import ObjectId
-
+from .llms.llm_provider import LLMProvider
+from .llms.llm_factory import create_llm_provider
+from .llms.azure import AzureOpenAI
 from .llms.openai import OpenAI
 from .memory_provider import MemoryProvider
 from .memory_unit import MemoryUnit
@@ -38,7 +40,8 @@ DEFAULT_MAX_STEPS = 20
 DEFAULT_TOOL_ACCESS = "private"
 
 class MemAgentModel(BaseModel):
-    model: Optional[OpenAI] = None
+    model: Optional[LLMProvider] = None
+    llm_config: Optional[Dict[str, Any]] = None # Configuration for the LLM
     agent_id: Optional[str] = None
     tools: Optional[Union[List, Toolbox]] = None
     persona: Optional[Persona] = None
@@ -62,7 +65,8 @@ class MemAgentModel(BaseModel):
 class MemAgent:
     def __init__(
         self,
-        model: Optional[OpenAI] = None, # LLM to use
+        model: Optional[LLMProvider] = None, # LLM to use
+        llm_config: Optional[Dict[str, Any]] = None, # Configuration for the LLM
         tools: Optional[Union[List, Toolbox]] = None, # List of tools to use or toolbox
         persona: Optional[Persona] = None, # Persona of the agent
         instruction: Optional[str] = None, # Instruction of the agent
@@ -138,9 +142,6 @@ class MemAgent:
             self.active_memory_types = ApplicationModeConfig.get_memory_types(self.application_mode)
             logger.info(f"Using application mode '{self.application_mode.value}' with memory types: {[mt.value for mt in self.active_memory_types]}")
 
-        # Initialize the memory unit based on the application mode
-        self.memory_unit = MemoryUnit(self.application_mode.value, self.memory_provider)
-        
         # Initialize semantic cache if enabled
         self.semantic_cache_instance = None
         if semantic_cache:
@@ -217,8 +218,16 @@ class MemAgent:
 
         # Initialize the model - honor caller's model if provided, else use default
         # This allows users to specify their own model configuration
-        self.model = model or OpenAI(model="gpt-4.1")
+        if model:
+            self.model = model
+        elif llm_config:
+            self.model = create_llm_provider(llm_config)
+        else:
+            self.model = OpenAI()
         
+        # Initialize the memory unit based on the application mode
+        self.memory_unit = MemoryUnit(self.application_mode.value, self.memory_provider, llm_provider=self.model)
+
         # Multi-agent setup
         self.delegates = delegates or []
         self.is_multi_agent_mode = len(self.delegates) > 0
@@ -1624,6 +1633,7 @@ class MemAgent:
         
         # Create a new MemAgentModel with the current object's attributes
         memagent_to_save = MemAgentModel(
+            llm_config=self.model.get_config() if self.model else None, # ✅ Correctly saves model config
             instruction=self.instruction,
             application_mode=self._get_application_mode_value(),
             memory_types=[mt.value for mt in self.active_memory_types],
@@ -1906,6 +1916,7 @@ class MemAgent:
                         logger.warning(f"Failed to save delegate {delegate.agent_id}: {e}")
 
         memagent_to_update = MemAgentModel(
+            llm_config=self.model.get_config() if self.model else None, # ✅ Correctly updates model config
             instruction=self.instruction,
             application_mode=self._get_application_mode_value(),
             memory_types=[mt.value for mt in self.active_memory_types],
@@ -1952,6 +1963,15 @@ class MemAgent:
         if not memagent:
             raise ValueError(f"MemAgent with agent id {agent_id} not found in the memory provider")
         
+        model_to_load = None
+        if hasattr(memagent, 'llm_config') and memagent.llm_config:
+            try:
+                model_to_load = create_llm_provider(memagent.llm_config)
+            except Exception as e:
+                logger.warning(f"Could not load model from config: {e}. Model will be None.")
+        elif hasattr(memagent, 'model') and memagent.model:
+            model_to_load = memagent.model
+
         # Get application_mode and memory_types from stored agent
         application_mode_to_use = None
         memory_types_to_use = None
@@ -2000,7 +2020,7 @@ class MemAgent:
 
         # Instantiate with saved parameters (and allow callers to override e.g. model)
         agent_instance = cls(
-            model=overrides.get("model", getattr(memagent, "model", None)),
+            model=overrides.get("model", model_to_load),
             tools=overrides.get("tools", getattr(memagent, "tools", None)),
             persona=overrides.get("persona", getattr(memagent, "persona", None)),
             instruction=overrides.get("instruction", getattr(memagent, "instruction", None)),
