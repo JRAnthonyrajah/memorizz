@@ -1964,13 +1964,13 @@ class MemAgent:
             raise ValueError(f"MemAgent with agent id {agent_id} not found in the memory provider")
         
         model_to_load = None
-        if hasattr(memagent_data, 'llm_config') and memagent_data.llm_config:
+        if hasattr(memagent, 'llm_config') and memagent.llm_config:
             try:
-                model_to_load = create_llm_provider(memagent_data.llm_config)
+                model_to_load = create_llm_provider(memagent.llm_config)
             except Exception as e:
                 logger.warning(f"Could not load model from config: {e}. Model will be None.")
-        elif hasattr(memagent_data, 'model') and memagent_data.model:
-            model_to_load = memagent_data.model
+        elif hasattr(memagent, 'model') and memagent.model:
+            model_to_load = memagent.model
 
         # Get application_mode and memory_types from stored agent
         application_mode_to_use = None

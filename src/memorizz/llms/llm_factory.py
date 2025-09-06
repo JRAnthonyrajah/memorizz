@@ -26,9 +26,7 @@ def create_llm_provider(config: Dict[str, Any]) -> LLMProvider:
     ValueError
         If the provider specified in the config is unknown.
     """
-    print("CREATE_LLM_PROVIDER")
     provider_name = config.get("provider", "openai").lower()
-    print(provider_name)
     if provider_name == "openai":
         # Create a copy of the config and remove the 'provider' key
         openai_config = config.copy()
