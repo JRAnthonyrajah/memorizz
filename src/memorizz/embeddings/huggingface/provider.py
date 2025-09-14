@@ -1,6 +1,6 @@
 # src/memorizz/embeddings/huggingface/provider.py
-import logging
-from typing import List, Dict, Any, Optional, Union
+import logging, os, re
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 
@@ -11,41 +11,19 @@ except Exception:
 
 try:
     from sentence_transformers import SentenceTransformer
-except Exception as e:
-    SentenceTransformer = None  # We'll raise a clear error in __init__
+except Exception:
+    SentenceTransformer = None
 
-from .. import BaseEmbeddingProvider  # provided by memorizz.embeddings package
+from .. import BaseEmbeddingProvider
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # 384-dim, fast
+_DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+_META_ERR_RE = re.compile(r"meta tensor|to_empty\(\)", re.IGNORECASE)
 
 
 class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
-    """
-    HuggingFace (local) embedding provider using `sentence-transformers`.
-
-    Config keys (all optional except `model` if you don't like the default):
-      - model: str
-          HF model id or local path. Default: all-MiniLM-L6-v2 (384 dims).
-      - device: str
-          "cpu", "cuda", "mps" (Apple), or None to auto-select.
-      - trust_remote_code: bool
-          Pass through to SentenceTransformer for custom models.
-      - normalize: bool
-          L2-normalize output vectors (default: True) for cosine similarity.
-      - dtype: str
-          "float32" (default) or "float16" (only if supported by device).
-      - batch_size: int
-          For future batch APIs; single-text calls ignore this.
-      - revision: str
-          Optional model revision/tag.
-      - cache_folder: str
-          Where to cache downloaded models.
-    """
-
-    # Popular models with known dimensions (for reference only).
-    # We still detect dynamically in case you supply any other model.
     KNOWN_MODEL_DIMS = {
         "sentence-transformers/all-MiniLM-L6-v2": 384,
         "sentence-transformers/all-MiniLM-L12-v2": 384,
@@ -61,9 +39,7 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config or {})
         if SentenceTransformer is None:
-            raise ImportError(
-                "sentence-transformers is required. Install with `pip install -U sentence-transformers`."
-            )
+            raise ImportError("sentence-transformers is required (pip install -U sentence-transformers).")
 
         self.model_id: str = self.config.get("model", _DEFAULT_MODEL)
         self.normalize: bool = bool(self.config.get("normalize", True))
@@ -79,50 +55,33 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
             dtype_str = "float32"
         self.dtype = np.float32 if dtype_str == "float32" else np.float16
 
-        # device selection
-        device_cfg: Optional[str] = self.config.get("device")
-        self.device: str = self._select_device(device_cfg)
+        # Select device (prefer MPS if present; otherwise CPU)
+        requested_device: Optional[str] = self.config.get("device")
+        self.device: str = self._select_device(requested_device)
 
-        # load model
-        logger.info("Loading HF sentence-transformer model=%s on device=%s", self.model_id, self.device)
-        self.model = SentenceTransformer(
-            self.model_id,
-            device=self.device,
-            trust_remote_code=self.trust_remote_code,
-            revision=self.revision,
-            cache_folder=self.cache_folder,
-        )
+        # Hard disable any Accelerate meta-init path that might be enabled by env
+        # (these envs are harmless if not present)
+        os.environ.pop("ACCELERATE_USE_FSDP", None)
+        os.environ.pop("ACCELERATE_MIXED_PRECISION", None)
 
-        # sentence-transformers exposes a reliable dimension getter
+        # Try loading on chosen device; on meta-related failure, retry on CPU.
+        self._init_on_device(self.device)
+
+        # Determine dimensions
         try:
             self._dims = int(self.model.get_sentence_embedding_dimension())
         except Exception:
-            # Fallback: try to infer with a tiny forward pass (should be rare)
             tmp = self._embed_text_local("__probe__")
             self._dims = int(len(tmp))
 
-        # Optional: move to half precision when on CUDA and requested
-        if torch is not None and self.device.startswith("cuda") and self.dtype == np.float16:
-            try:
-                self.model = self.model.half()  # type: ignore[attr-defined]
-            except Exception:
-                logger.warning("Requested float16 but model.half() not supported; continuing in float32.")
-                self.dtype = np.float32
+        logger.info("Initialized HuggingFace provider model=%s, dims=%d, device=%s, normalize=%s",
+                    self.model_id, self._dims, self.device, self.normalize)
 
-        logger.info("Initialized HuggingFace provider model=%s, dims=%d, normalize=%s",
-                    self.model_id, self._dims, self.normalize)
-
-    # ----- BaseEmbeddingProvider API -----
+    # ---------- BaseEmbeddingProvider API ----------
 
     def get_embedding(self, text: str, **kwargs) -> List[float]:
-        """
-        Compute an embedding for a single string.
-        Per-call overrides:
-          - normalize: bool
-        """
         if not isinstance(text, str):
             text = str(text)
-
         normalize = bool(kwargs.get("normalize", self.normalize))
         vec = self._embed_text_local(text, normalize=normalize)
         return vec
@@ -133,57 +92,100 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
     def get_default_model(self) -> str:
         return self.model_id
 
-    # ----- Class helpers (optional, align with OpenAI example) -----
-
     @classmethod
     def get_available_models(cls) -> List[str]:
-        # We can’t enumerate HF hub without network; return a curated list.
         return list(cls.KNOWN_MODEL_DIMS.keys())
 
     @classmethod
     def get_model_max_dimensions(cls, model: str) -> int:
-        # For local models, “max” = actual dimension. Unknown → probe at runtime.
         return int(cls.KNOWN_MODEL_DIMS.get(model, 4096))
 
-    # ----- Internal helpers -----
+    # ---------- Internals ----------
 
     def _select_device(self, device_cfg: Optional[str]) -> str:
         if device_cfg:
             return device_cfg
-        # Auto-select
         if torch is None:
             return "cpu"
         if torch.cuda.is_available():
             return "cuda"
-        # Apple Silicon w/ MPS
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # type: ignore[attr-defined]
-            return "mps"
+        # MPS can stay as opt-in; uncomment next two lines only if you know it's stable in your env.
+        # if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        #     return "mps"
         return "cpu"
+
+
+    def _init_on_device(self, device: str) -> None:
+        logger.info("Loading SentenceTransformer(model=%s) on CPU first (target=%s)", self.model_id, device)
+        try:
+            # 1) Materialize weights on CPU — guarantees real tensors, not 'meta'
+            self.model = SentenceTransformer(
+                self.model_id,
+                device="cpu",
+                trust_remote_code=self.trust_remote_code,
+                revision=self.revision,
+                cache_folder=self.cache_folder,
+            )
+            # 2) Warm-up on CPU to fully instantiate modules
+            _ = self.model.encode("__warmup__", convert_to_numpy=True, show_progress_bar=False)
+
+            # 3) Only then, move to the requested device (if not CPU)
+            if device and device.lower() != "cpu":
+                # SentenceTransformer proxies .to(...) to underlying torch modules
+                try:
+                    self.model = self.model.to(device)  # type: ignore[attr-defined]
+                except Exception as e:
+                    # If MPS/CUDA move fails, fall back to CPU (no meta tensors involved)
+                    logger.warning("Move to device '%s' failed (%s); staying on CPU.", device, e)
+                    device = "cpu"
+
+            # 4) Optional: honor float16 only on CUDA (MPS/CPU stay float32)
+            if torch is not None and device.startswith("cuda") and self.dtype == np.float16:
+                try:
+                    self.model = self.model.half()  # type: ignore[attr-defined]
+                except Exception:
+                    logger.warning("float16 requested but not supported; using float32.")
+                    self.dtype = np.float32
+
+            self.device = device
+        except Exception as e:
+            # If anything unexpected resembles meta-tensor flow, retry cleanly on CPU
+            text = str(e)
+            if _META_ERR_RE.search(text):
+                logger.error("Meta-device trace detected; retrying clean on CPU. Detail: %s", text)
+                self.device = "cpu"
+                self.model = SentenceTransformer(
+                    self.model_id,
+                    device="cpu",
+                    trust_remote_code=self.trust_remote_code,
+                    revision=self.revision,
+                    cache_folder=self.cache_folder,
+                )
+                _ = self.model.encode("__warmup__", convert_to_numpy=True, show_progress_bar=False)
+            else:
+                raise
+
 
     def _embed_text_local(self, text: str, normalize: Optional[bool] = None) -> List[float]:
         text = (text or "").replace("\n", " ").strip()
         if not text:
-            return [0.0] * self._dims
+            return [0.0] * getattr(self, "_dims", 384)
 
-        # sentence-transformers returns numpy array when convert_to_numpy=True
         vec = self.model.encode(
             text,
             convert_to_numpy=True,
-            normalize_embeddings=False,  # we handle normalization to control dtype
+            normalize_embeddings=False,
             batch_size=1,
             show_progress_bar=False,
         )
-
         vec = vec.astype(self.dtype, copy=False)
 
         do_norm = self.normalize if normalize is None else bool(normalize)
         if do_norm:
-            # L2 normalize
             denom = np.linalg.norm(vec)
             if denom > 0:
                 vec = vec / denom
 
-        # Ensure Python list[float]
-        if vec.dtype != np.float32 and vec.dtype != np.float64:
+        if vec.dtype not in (np.float32, np.float64):
             vec = vec.astype(np.float32)
         return vec.tolist()
