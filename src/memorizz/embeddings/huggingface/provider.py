@@ -1,6 +1,16 @@
 # src/memorizz/embeddings/huggingface/provider.py
 import logging, os, re
 from typing import List, Dict, Any, Optional
+# --- MUST RUN BEFORE importing torch/transformers/sentence_transformers ---
+import os
+# Block any meta-device initialization
+os.environ.setdefault("PYTORCH_DISABLE_META_DEVICE", "1")
+# Disable accelerate meta-style loading paths
+os.environ.setdefault("ACCELERATE_USE_FSDP", "false")
+os.environ.setdefault("ACCELERATE_MIXED_PRECISION", "no")
+# Optional: make transformers avoid tricky CPU-mem fastpaths
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+# --------------------------------------------------------------------------
 
 import numpy as np
 
@@ -10,7 +20,7 @@ except Exception:
     torch = None
 
 try:
-    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.models import Transformer, Pooling
 except Exception:
     SentenceTransformer = None
 
@@ -114,56 +124,72 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
         #     return "mps"
         return "cpu"
 
+    def _has_meta_tensors(nn_module) -> bool:
+        # Inspect parameters/buffers to catch any accidental meta tensors
+        try:
+            for p in nn_module.parameters():
+                if getattr(p, "is_meta", False):
+                    return True
+            for b in nn_module.buffers():
+                if getattr(b, "is_meta", False):
+                    return True
+        except Exception:
+            pass
+        return False
 
     def _init_on_device(self, device: str) -> None:
-        logger.info("Loading SentenceTransformer(model=%s) on CPU first (target=%s)", self.model_id, device)
+        logger.info("Initializing HF embeddings (CPU-first) model=%s target=%s", self.model_id, device)
+
+        # 0) If available, force default device away from meta (PyTorch >=2.1)
         try:
-            # 1) Materialize weights on CPU — guarantees real tensors, not 'meta'
-            self.model = SentenceTransformer(
-                self.model_id,
-                device="cpu",
-                trust_remote_code=self.trust_remote_code,
-                revision=self.revision,
-                cache_folder=self.cache_folder,
-            )
-            # 2) Warm-up on CPU to fully instantiate modules
-            _ = self.model.encode("__warmup__", convert_to_numpy=True, show_progress_bar=False)
+            if hasattr(torch, "set_default_device"):
+                torch.set_default_device("cpu")
+        except Exception:
+            pass
 
-            # 3) Only then, move to the requested device (if not CPU)
-            if device and device.lower() != "cpu":
-                # SentenceTransformer proxies .to(...) to underlying torch modules
-                try:
-                    self.model = self.model.to(device)  # type: ignore[attr-defined]
-                except Exception as e:
-                    # If MPS/CUDA move fails, fall back to CPU (no meta tensors involved)
-                    logger.warning("Move to device '%s' failed (%s); staying on CPU.", device, e)
-                    device = "cpu"
+        # 1) Build via low-level modules on CPU (materialized tensors)
+        word = Transformer(
+            self.model_id,
+            cache_dir=self.cache_folder,
+            model_args={"trust_remote_code": self.trust_remote_code},
+            device="cpu",
+        )
+        pool = Pooling(word.get_word_embedding_dimension())
+        self.model = SentenceTransformer(modules=[word, pool], device="cpu")
 
-            # 4) Optional: honor float16 only on CUDA (MPS/CPU stay float32)
-            if torch is not None and device.startswith("cuda") and self.dtype == np.float16:
-                try:
-                    self.model = self.model.half()  # type: ignore[attr-defined]
-                except Exception:
-                    logger.warning("float16 requested but not supported; using float32.")
-                    self.dtype = np.float32
+        # 2) Warm-up on CPU to ensure everything is fully instantiated
+        _ = self.model.encode("__warmup__", convert_to_numpy=True, show_progress_bar=False)
 
-            self.device = device
-        except Exception as e:
-            # If anything unexpected resembles meta-tensor flow, retry cleanly on CPU
-            text = str(e)
-            if _META_ERR_RE.search(text):
-                logger.error("Meta-device trace detected; retrying clean on CPU. Detail: %s", text)
-                self.device = "cpu"
-                self.model = SentenceTransformer(
-                    self.model_id,
-                    device="cpu",
-                    trust_remote_code=self.trust_remote_code,
-                    revision=self.revision,
-                    cache_folder=self.cache_folder,
-                )
-                _ = self.model.encode("__warmup__", convert_to_numpy=True, show_progress_bar=False)
-            else:
-                raise
+        # 3) Sanity check: no meta tensors should exist at this point
+        if _has_meta_tensors(self.model):
+            raise RuntimeError("Meta tensors detected after CPU build; aborting device move.")
+
+        # 4) Move to target device if not CPU
+        if device.lower() != "cpu":
+            try:
+                self.model = self.model.to(device)  # type: ignore[attr-defined]
+            except Exception as e:
+                logger.warning("Move to device '%s' failed (%s); staying on CPU.", device, e)
+                device = "cpu"
+
+        # 5) Optional fp16 only on CUDA
+        if torch is not None and device.startswith("cuda") and self.dtype == np.float16:
+            try:
+                self.model = self.model.half()  # type: ignore[attr-defined]
+            except Exception:
+                logger.warning("float16 requested but not supported; using float32.")
+                self.dtype = np.float32
+
+        # 6) Record final device and dimensions
+        self.device = device
+        try:
+            self._dims = int(self.model.get_sentence_embedding_dimension())
+        except Exception:
+            vec = self._embed_text_local("__probe__")
+            self._dims = len(vec)
+
+        logger.info("HF provider ready: model=%s dims=%d device=%s normalize=%s",
+                    self.model_id, self._dims, self.device, self.normalize)
 
 
     def _embed_text_local(self, text: str, normalize: Optional[bool] = None) -> List[float]:
