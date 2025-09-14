@@ -1,35 +1,39 @@
 # src/memorizz/embeddings/huggingface/provider.py
-import logging, os, re
-from typing import List, Dict, Any, Optional
 # --- MUST RUN BEFORE importing torch/transformers/sentence_transformers ---
 import os
-# Block any meta-device initialization
 os.environ.setdefault("PYTORCH_DISABLE_META_DEVICE", "1")
-# Disable accelerate meta-style loading paths
 os.environ.setdefault("ACCELERATE_USE_FSDP", "false")
 os.environ.setdefault("ACCELERATE_MIXED_PRECISION", "no")
-# Optional: make transformers avoid tricky CPU-mem fastpaths
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 # --------------------------------------------------------------------------
 
+import logging, re
+from typing import List, Dict, Any, Optional
 import numpy as np
 
+# Torch is optional; we can run CPU-only without it
 try:
     import torch
 except Exception:
     torch = None
 
+# Import BOTH the high-level wrapper and low-level modules
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
+
 try:
     from sentence_transformers.models import Transformer, Pooling
 except Exception:
-    SentenceTransformer = None
+    Transformer = None
+    Pooling = None
 
 from .. import BaseEmbeddingProvider
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
 _META_ERR_RE = re.compile(r"meta tensor|to_empty\(\)", re.IGNORECASE)
 
 
@@ -48,8 +52,13 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config or {})
-        if SentenceTransformer is None:
-            raise ImportError("sentence-transformers is required (pip install -U sentence-transformers).")
+
+        # Ensure required deps are present (clear error if worker venv is missing packages)
+        if SentenceTransformer is None or Transformer is None or Pooling is None:
+            raise ImportError(
+                "sentence-transformers is required (pip install -U sentence-transformers). "
+                "Ensure it is installed in the SAME environment your Celery worker uses."
+            )
 
         self.model_id: str = self.config.get("model", _DEFAULT_MODEL)
         self.normalize: bool = bool(self.config.get("normalize", True))
@@ -65,16 +74,15 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
             dtype_str = "float32"
         self.dtype = np.float32 if dtype_str == "float32" else np.float16
 
-        # Select device (prefer MPS if present; otherwise CPU)
+        # Select device (CUDA > CPU). Keep MPS opt-in to avoid edge cases.
         requested_device: Optional[str] = self.config.get("device")
         self.device: str = self._select_device(requested_device)
 
-        # Hard disable any Accelerate meta-init path that might be enabled by env
-        # (these envs are harmless if not present)
+        # Hard-disable accelerate meta-init paths (harmless if absent)
         os.environ.pop("ACCELERATE_USE_FSDP", None)
         os.environ.pop("ACCELERATE_MIXED_PRECISION", None)
 
-        # Try loading on chosen device; on meta-related failure, retry on CPU.
+        # Initialize model (CPU-first; then move if needed)
         self._init_on_device(self.device)
 
         # Determine dimensions
@@ -84,8 +92,10 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
             tmp = self._embed_text_local("__probe__")
             self._dims = int(len(tmp))
 
-        logger.info("Initialized HuggingFace provider model=%s, dims=%d, device=%s, normalize=%s",
-                    self.model_id, self._dims, self.device, self.normalize)
+        logger.info(
+            "Initialized HuggingFace provider model=%s, dims=%d, device=%s, normalize=%s",
+            self.model_id, self._dims, self.device, self.normalize
+        )
 
     # ---------- BaseEmbeddingProvider API ----------
 
@@ -93,8 +103,7 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
         if not isinstance(text, str):
             text = str(text)
         normalize = bool(kwargs.get("normalize", self.normalize))
-        vec = self._embed_text_local(text, normalize=normalize)
-        return vec
+        return self._embed_text_local(text, normalize=normalize)
 
     def get_dimensions(self) -> int:
         return int(self._dims)
@@ -119,13 +128,14 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
             return "cpu"
         if torch.cuda.is_available():
             return "cuda"
-        # MPS can stay as opt-in; uncomment next two lines only if you know it's stable in your env.
+        # If you have verified MPS stability, you may enable it:
         # if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         #     return "mps"
         return "cpu"
 
+    @staticmethod
     def _has_meta_tensors(nn_module) -> bool:
-        # Inspect parameters/buffers to catch any accidental meta tensors
+        """Inspect parameters/buffers to catch any accidental meta tensors."""
         try:
             for p in nn_module.parameters():
                 if getattr(p, "is_meta", False):
@@ -140,14 +150,14 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
     def _init_on_device(self, device: str) -> None:
         logger.info("Initializing HF embeddings (CPU-first) model=%s target=%s", self.model_id, device)
 
-        # 0) If available, force default device away from meta (PyTorch >=2.1)
+        # Steer default device away from 'meta' (PyTorch >= 2.1)
         try:
-            if hasattr(torch, "set_default_device"):
+            if torch is not None and hasattr(torch, "set_default_device"):
                 torch.set_default_device("cpu")
         except Exception:
             pass
 
-        # 1) Build via low-level modules on CPU (materialized tensors)
+        # 1) Build via low-level modules on CPU (materialized tensors; avoids accelerate/meta fastpath)
         word = Transformer(
             self.model_id,
             cache_dir=self.cache_folder,
@@ -157,11 +167,11 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
         pool = Pooling(word.get_word_embedding_dimension())
         self.model = SentenceTransformer(modules=[word, pool], device="cpu")
 
-        # 2) Warm-up on CPU to ensure everything is fully instantiated
+        # 2) Warm-up on CPU to ensure full instantiation
         _ = self.model.encode("__warmup__", convert_to_numpy=True, show_progress_bar=False)
 
-        # 3) Sanity check: no meta tensors should exist at this point
-        if _has_meta_tensors(self.model):
+        # 3) Verify there are no meta tensors
+        if self._has_meta_tensors(self.model):
             raise RuntimeError("Meta tensors detected after CPU build; aborting device move.")
 
         # 4) Move to target device if not CPU
@@ -180,17 +190,8 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
                 logger.warning("float16 requested but not supported; using float32.")
                 self.dtype = np.float32
 
-        # 6) Record final device and dimensions
+        # 6) Record final device
         self.device = device
-        try:
-            self._dims = int(self.model.get_sentence_embedding_dimension())
-        except Exception:
-            vec = self._embed_text_local("__probe__")
-            self._dims = len(vec)
-
-        logger.info("HF provider ready: model=%s dims=%d device=%s normalize=%s",
-                    self.model_id, self._dims, self.device, self.normalize)
-
 
     def _embed_text_local(self, text: str, normalize: Optional[bool] = None) -> List[float]:
         text = (text or "").replace("\n", " ").strip()
@@ -204,7 +205,12 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
             batch_size=1,
             show_progress_bar=False,
         )
-        vec = vec.astype(self.dtype, copy=False)
+
+        # Keep dtype consistent; only allow fp16 on CUDA
+        if self.dtype == np.float16 and not (torch is not None and str(self.device).startswith("cuda")):
+            vec = vec.astype(np.float32, copy=False)
+        else:
+            vec = vec.astype(self.dtype, copy=False)
 
         do_norm = self.normalize if normalize is None else bool(normalize)
         if do_norm:
