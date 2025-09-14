@@ -147,30 +147,36 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
             pass
         return False
 
-    def _init_on_device(self, device: str) -> None:
-        logger.info("Initializing HF embeddings (CPU-first) model=%s target=%s", self.model_id, device)
 
-        # Steer default device away from 'meta' (PyTorch >= 2.1)
+    def _init_on_device(self, device: str) -> None:
+        logger.info(
+            "Initializing HF embeddings (CPU-first) model=%s target=%s",
+            self.model_id, device
+        )
+
+        # Keep default device away from 'meta' (PyTorch ≥ 2.1)
         try:
             if torch is not None and hasattr(torch, "set_default_device"):
                 torch.set_default_device("cpu")
         except Exception:
             pass
 
-        # 1) Build via low-level modules on CPU (materialized tensors; avoids accelerate/meta fastpath)
+        # 1) Build via low-level modules on CPU (no accelerate/meta fastpath)
+        # NOTE: Transformer(...) has NO 'device' kwarg.
         word = Transformer(
             self.model_id,
             cache_dir=self.cache_folder,
             model_args={"trust_remote_code": self.trust_remote_code},
-            device="cpu",
         )
         pool = Pooling(word.get_word_embedding_dimension())
+
+        # SentenceTransformer DOES accept device
         self.model = SentenceTransformer(modules=[word, pool], device="cpu")
 
-        # 2) Warm-up on CPU to ensure full instantiation
+        # 2) Warm-up on CPU to fully instantiate weights/buffers
         _ = self.model.encode("__warmup__", convert_to_numpy=True, show_progress_bar=False)
 
-        # 3) Verify there are no meta tensors
+        # 3) Verify no meta tensors exist
         if self._has_meta_tensors(self.model):
             raise RuntimeError("Meta tensors detected after CPU build; aborting device move.")
 
@@ -182,7 +188,7 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
                 logger.warning("Move to device '%s' failed (%s); staying on CPU.", device, e)
                 device = "cpu"
 
-        # 5) Optional fp16 only on CUDA
+        # 5) Optional: fp16 only on CUDA
         if torch is not None and device.startswith("cuda") and self.dtype == np.float16:
             try:
                 self.model = self.model.half()  # type: ignore[attr-defined]
@@ -190,8 +196,19 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
                 logger.warning("float16 requested but not supported; using float32.")
                 self.dtype = np.float32
 
-        # 6) Record final device
+        # 6) Record final device and dims
         self.device = device
+        try:
+            self._dims = int(self.model.get_sentence_embedding_dimension())
+        except Exception:
+            vec = self._embed_text_local("__probe__")
+            self._dims = len(vec)
+
+        logger.info(
+            "HF provider ready: model=%s dims=%d device=%s normalize=%s",
+            self.model_id, self._dims, self.device, self.normalize
+        )
+
 
     def _embed_text_local(self, text: str, normalize: Optional[bool] = None) -> List[float]:
         text = (text or "").replace("\n", " ").strip()
@@ -202,7 +219,7 @@ class HuggingFaceEmbeddingProvider(BaseEmbeddingProvider):
             text,
             convert_to_numpy=True,
             normalize_embeddings=False,
-            batch_size=1,
+            batch_size=self.batch_size,
             show_progress_bar=False,
         )
 
