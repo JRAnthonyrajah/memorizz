@@ -7,7 +7,7 @@ name = "memorizz"
 version = "0.0.32"
 description = "A memory management library for Python"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 license = "MIT"
 authors = [
     { name = "Richmond Alake", email = "richmond.alake@gmail.com" }
@@ -17,14 +17,34 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
+# —— Base deps only (safe across 3.7+) ——
 dependencies = [
     "openai",
     "pymongo",
-    "langchain_ollama",
-    "ollama",
-    "numpy",
-    "voyageai"
+    # NumPy wheels by Python version:
+    "numpy==1.21.6; python_version < '3.8'",
+    "numpy>=1.26.4,<2.0; python_version >= '3.8' and python_version < '3.12'",
+    "numpy>=2.0.0,<3.0; python_version >= '3.12'",
 ]
+
+
+# —— Optional provider extras with Python markers ——
+[project.optional-dependencies]
+huggingface = [
+    "sentence-transformers>=3,<4; python_version >= '3.8'",
+    "huggingface-hub>=0.34.4,<0.35; python_version >= '3.8'"
+]
+voyageai = [
+    "voyageai; python_version >= '3.9' and python_version < '3.14'"
+]
+ollama = [
+    "ollama; python_version >= '3.8' and python_version < '4.0'",
+    "langchain-ollama; python_version >= '3.9' and python_version < '4.0'"
+]
+xai = [
+  "httpx>=0.27,<0.28"  # used below; you can swap for 'openai>=1.40' if you prefer its OpenAI-compatible client
+]
+
 
 [project.urls]
 "Homepage" = "https://github.com/RichmondAlake/memorizz"

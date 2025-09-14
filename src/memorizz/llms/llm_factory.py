@@ -4,6 +4,7 @@ from typing import Dict, Any
 from .llm_provider import LLMProvider
 from .openai import OpenAI
 from .azure import AzureOpenAI
+from .grok import Grok
 
 def create_llm_provider(config: Dict[str, Any]) -> LLMProvider:
     """
@@ -42,7 +43,11 @@ def create_llm_provider(config: Dict[str, Any]) -> LLMProvider:
             api_version=azure_config.get("api_version"),
             deployment_name=azure_config.get("deployment_name"),
         )
-    
+    elif provider_name == "grok":  # <-- new branch
+        grok_config = config.copy()
+        grok_config.pop("provider", None)
+        # accepted kwargs: api_key (optional), model, base_url (optional)
+        return Grok(**grok_config)
     # To extend, add more providers here:
     # elif provider_name == "anthropic":
     #     ...

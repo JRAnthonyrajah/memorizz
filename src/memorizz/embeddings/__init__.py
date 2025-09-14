@@ -11,6 +11,7 @@ class EmbeddingProvider(Enum):
     OLLAMA = "ollama"
     VOYAGEAI = "voyageai"
     AZURE = "azure"
+    HUGGINGFACE = "huggingface"   # <- ADD THIS
 
 class BaseEmbeddingProvider(ABC):
     """Abstract base class for embedding providers."""
@@ -110,6 +111,9 @@ class EmbeddingManager:
         elif self.provider_type == EmbeddingProvider.VOYAGEAI:
             from .voyageai import VoyageAIEmbeddingProvider
             return VoyageAIEmbeddingProvider(self.config)
+        elif self.provider_type == EmbeddingProvider.HUGGINGFACE:       # <- ADD THIS
+            from .huggingface import HuggingFaceEmbeddingProvider
+            return HuggingFaceEmbeddingProvider(self.config)
         else:
             raise ValueError(f"Provider {self.provider_type} not implemented")
     
