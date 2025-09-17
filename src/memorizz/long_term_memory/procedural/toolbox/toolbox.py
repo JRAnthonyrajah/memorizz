@@ -9,8 +9,12 @@ from ....embeddings import get_embedding
 import inspect
 from .tool_schema import ToolSchemaType
 from bson import ObjectId
+import logging
 
-# ------------------ Step 1: Define a Generic LLM Interface ------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+# -------------- Step 1: Define a Generic LLM Interface ------------------
 # This protocol defines the "contract" any compatible LLM provider must follow.
 # It's good practice to place this in a separate file (e.g., llm_provider_protocol.py)
 # but it's included here for a complete, single-file response.
@@ -108,6 +112,16 @@ class Toolbox:
         if func is None:
             return decorator
         return decorator(func)
+
+    def replace_function_by_id(self, tool_id: str, func: Callable) -> bool:
+            """Replace the callable function for a tool by its ID."""
+            if tool_id not in self._tools:
+                log.warning(f"[toolbox.replace_function_by_id] Tool ID {tool_id} not found in in-memory tools")
+                return False
+            self._tools[tool_id] = func
+            log.debug(f"[toolbox.replace_function_by_id] Replaced function for tool ID {tool_id}")
+            return True
+
 
     def get_tool_by_name(self, name: str) -> Optional[Dict[str, Any]]:
         """
