@@ -95,41 +95,46 @@ class Toolbox:
                 queries = self._generate_queries(augmented_docstring)
                 embedding = get_embedding(f"{f.__name__} {augmented_docstring} {signature} {queries}")
                 tool_data = self._get_tool_metadata(f)
-                # --- critically: prefer the runtime tool's schema over any provider prettification ---
+                tool_data_dict = tool_data.model_dump()  # <<— work on plain dicts
+
                 runtime_schema = getattr(f, "parameters", None)
                 if _looks_like_json_schema(runtime_schema):
-                    # Ensure it’s clean JSON-Schema (arrays have items, etc.)
-                    tool_data.function["parameters"] = _sanitize_schema(runtime_schema)
+                    tool_data_dict["function"]["parameters"] = _sanitize_schema(runtime_schema)
                 else:
-                    # Fall back to whatever the provider returned, but guard against prettified strings
-                    prov_params = tool_data.function.get("parameters")
-                    if not _looks_like_json_schema(prov_params):
-                        log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; clearing to avoid OpenAI errors", f.__name__)
-                        tool_data.function["parameters"] = {"type": "object", "properties": {}, "required": []}
+                    prov_params = tool_data_dict["function"].get("parameters")
+                    if _looks_like_json_schema(prov_params):
+                        tool_data_dict["function"]["parameters"] = _sanitize_schema(prov_params)
+                    else:
+                        log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; defaulting to empty object.", f.__name__)
+                        tool_data_dict["function"]["parameters"] = {"type": "object", "properties": {}, "required": []}
+
                 tool_dict = {
                     "_id": object_id,
                     "embedding": embedding,
-                    "queries": queries,
-                    **tool_data.model_dump()
+                    # include queries if augment=True
+                    **tool_data_dict,
                 }
             else:
                 embedding = get_embedding(f"{f.__name__} {docstring} {signature}")
                 tool_data = self._get_tool_metadata(f)
-                # --- critically: prefer the runtime tool's schema over any provider prettification ---
+                tool_data_dict = tool_data.model_dump()  # <<— work on plain dicts
+
                 runtime_schema = getattr(f, "parameters", None)
                 if _looks_like_json_schema(runtime_schema):
-                    # Ensure it’s clean JSON-Schema (arrays have items, etc.)
-                    tool_data.function["parameters"] = _sanitize_schema(runtime_schema)
+                    tool_data_dict["function"]["parameters"] = _sanitize_schema(runtime_schema)
                 else:
-                    # Fall back to whatever the provider returned, but guard against prettified strings
-                    prov_params = tool_data.function.get("parameters")
-                    if not _looks_like_json_schema(prov_params):
-                        log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; clearing to avoid OpenAI errors", f.__name__)
-                        tool_data.function["parameters"] = {"type": "object", "properties": {}, "required": []}
+                    prov_params = tool_data_dict["function"].get("parameters")
+                    if _looks_like_json_schema(prov_params):
+                        tool_data_dict["function"]["parameters"] = _sanitize_schema(prov_params)
+                    else:
+                        log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; defaulting to empty object.", f.__name__)
+                        tool_data_dict["function"]["parameters"] = {"type": "object", "properties": {}, "required": []}
+
                 tool_dict = {
                     "_id": object_id,
                     "embedding": embedding,
-                    **tool_data.model_dump()
+                    # include queries if augment=True
+                    **tool_data_dict,
                 }
             
             self.memory_provider.store(tool_dict, memory_store_type=MemoryType.TOOLBOX)
