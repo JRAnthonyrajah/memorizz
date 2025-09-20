@@ -82,13 +82,30 @@ class Toolbox:
             object_id = ObjectId()
             object_id_str = str(object_id)
 
+
+            def _looks_like_json_schema(x: Any) -> bool:
+                return isinstance(x, Mapping) and x.get("type") == "object" and "properties" in x
+
+            def _sanitize_schema(schema: dict) -> dict:
+                # optional: call your normalizer here if available
+                return schema
             if augment:
                 # Use the configured LLM provider for augmentation
                 augmented_docstring = self._augment_docstring(docstring)
                 queries = self._generate_queries(augmented_docstring)
                 embedding = get_embedding(f"{f.__name__} {augmented_docstring} {signature} {queries}")
                 tool_data = self._get_tool_metadata(f)
-                
+                # --- critically: prefer the runtime tool's schema over any provider prettification ---
+                runtime_schema = getattr(f, "parameters", None)
+                if _looks_like_json_schema(runtime_schema):
+                    # Ensure it’s clean JSON-Schema (arrays have items, etc.)
+                    tool_data.function["parameters"] = _sanitize_schema(runtime_schema)
+                else:
+                    # Fall back to whatever the provider returned, but guard against prettified strings
+                    prov_params = tool_data.function.get("parameters")
+                    if not _looks_like_json_schema(prov_params):
+                        log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; clearing to avoid OpenAI errors", f.__name__)
+                        tool_data.function["parameters"] = {"type": "object", "properties": {}, "required": []}
                 tool_dict = {
                     "_id": object_id,
                     "embedding": embedding,
@@ -98,7 +115,17 @@ class Toolbox:
             else:
                 embedding = get_embedding(f"{f.__name__} {docstring} {signature}")
                 tool_data = self._get_tool_metadata(f)
-                
+                # --- critically: prefer the runtime tool's schema over any provider prettification ---
+                runtime_schema = getattr(f, "parameters", None)
+                if _looks_like_json_schema(runtime_schema):
+                    # Ensure it’s clean JSON-Schema (arrays have items, etc.)
+                    tool_data.function["parameters"] = _sanitize_schema(runtime_schema)
+                else:
+                    # Fall back to whatever the provider returned, but guard against prettified strings
+                    prov_params = tool_data.function.get("parameters")
+                    if not _looks_like_json_schema(prov_params):
+                        log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; clearing to avoid OpenAI errors", f.__name__)
+                        tool_data.function["parameters"] = {"type": "object", "properties": {}, "required": []}
                 tool_dict = {
                     "_id": object_id,
                     "embedding": embedding,
