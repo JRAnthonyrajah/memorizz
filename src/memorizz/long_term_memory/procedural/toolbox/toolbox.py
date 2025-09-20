@@ -2,7 +2,7 @@
 # This refactored code adds support for any LLM provider while maintaining
 # full backward compatibility with the original OpenAI implementation.
 
-from typing import Dict, Any, List, Callable, Optional, Union, Protocol
+from typing import Dict, Any, List, Callable, Optional, Union, Protocol, Mapping
 from ....memory_provider import MemoryProvider
 from ....enums.memory_type import MemoryType
 from ....embeddings import get_embedding
