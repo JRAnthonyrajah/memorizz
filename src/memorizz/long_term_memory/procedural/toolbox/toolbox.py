@@ -111,8 +111,10 @@ class Toolbox:
                 tool_dict = {
                     "_id": object_id,
                     "embedding": embedding,
+                    "queries": queries,
+                    **tool_data.model_dump(),
                     # include queries if augment=True
-                    **tool_data_dict,
+                    # **tool_data_dict,
                 }
             else:
                 embedding = get_embedding(f"{f.__name__} {docstring} {signature}")
@@ -133,8 +135,9 @@ class Toolbox:
                 tool_dict = {
                     "_id": object_id,
                     "embedding": embedding,
+                    **tool_data.model_dump(),
                     # include queries if augment=True
-                    **tool_data_dict,
+                #     **tool_data_dict,
                 }
             
             self.memory_provider.store(tool_dict, memory_store_type=MemoryType.TOOLBOX)
