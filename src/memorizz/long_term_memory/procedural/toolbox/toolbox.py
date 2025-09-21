@@ -83,30 +83,30 @@ class Toolbox:
             object_id_str = str(object_id)
 
 
-            def _looks_like_json_schema(x: Any) -> bool:
-                return isinstance(x, Mapping) and x.get("type") == "object" and "properties" in x
+            # def _looks_like_json_schema(x: Any) -> bool:
+            #     return isinstance(x, Mapping) and x.get("type") == "object" and "properties" in x
 
-            def _sanitize_schema(schema: dict) -> dict:
-                # optional: call your normalizer here if available
-                return schema
+            # def _sanitize_schema(schema: dict) -> dict:
+            #     # optional: call your normalizer here if available
+            #     return schema
             if augment:
                 # Use the configured LLM provider for augmentation
                 augmented_docstring = self._augment_docstring(docstring)
                 queries = self._generate_queries(augmented_docstring)
                 embedding = get_embedding(f"{f.__name__} {augmented_docstring} {signature} {queries}")
                 tool_data = self._get_tool_metadata(f)
-                tool_data_dict = tool_data.model_dump()  # <<— work on plain dicts
+                # tool_data_dict = tool_data.model_dump()  # <<— work on plain dicts
 
-                runtime_schema = getattr(f, "parameters", None)
-                if _looks_like_json_schema(runtime_schema):
-                    tool_data_dict["function"]["parameters"] = _sanitize_schema(runtime_schema)
-                else:
-                    prov_params = tool_data_dict["function"].get("parameters")
-                    if _looks_like_json_schema(prov_params):
-                        tool_data_dict["function"]["parameters"] = _sanitize_schema(prov_params)
-                    else:
-                        log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; defaulting to empty object.", f.__name__)
-                        tool_data_dict["function"]["parameters"] = {"type": "object", "properties": {}, "required": []}
+                # runtime_schema = getattr(f, "parameters", None)
+                # if _looks_like_json_schema(runtime_schema):
+                #     tool_data_dict["function"]["parameters"] = _sanitize_schema(runtime_schema)
+                # else:
+                #     prov_params = tool_data_dict["function"].get("parameters")
+                #     if _looks_like_json_schema(prov_params):
+                #         tool_data_dict["function"]["parameters"] = _sanitize_schema(prov_params)
+                #     else:
+                #         log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; defaulting to empty object.", f.__name__)
+                #         tool_data_dict["function"]["parameters"] = {"type": "object", "properties": {}, "required": []}
 
                 tool_dict = {
                     "_id": object_id,
@@ -117,18 +117,18 @@ class Toolbox:
             else:
                 embedding = get_embedding(f"{f.__name__} {docstring} {signature}")
                 tool_data = self._get_tool_metadata(f)
-                tool_data_dict = tool_data.model_dump()  # <<— work on plain dicts
+                # tool_data_dict = tool_data.model_dump()  # <<— work on plain dicts
 
-                runtime_schema = getattr(f, "parameters", None)
-                if _looks_like_json_schema(runtime_schema):
-                    tool_data_dict["function"]["parameters"] = _sanitize_schema(runtime_schema)
-                else:
-                    prov_params = tool_data_dict["function"].get("parameters")
-                    if _looks_like_json_schema(prov_params):
-                        tool_data_dict["function"]["parameters"] = _sanitize_schema(prov_params)
-                    else:
-                        log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; defaulting to empty object.", f.__name__)
-                        tool_data_dict["function"]["parameters"] = {"type": "object", "properties": {}, "required": []}
+                # runtime_schema = getattr(f, "parameters", None)
+                # if _looks_like_json_schema(runtime_schema):
+                #     tool_data_dict["function"]["parameters"] = _sanitize_schema(runtime_schema)
+                # else:
+                #     prov_params = tool_data_dict["function"].get("parameters")
+                #     if _looks_like_json_schema(prov_params):
+                #         tool_data_dict["function"]["parameters"] = _sanitize_schema(prov_params)
+                #     else:
+                #         log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; defaulting to empty object.", f.__name__)
+                #         tool_data_dict["function"]["parameters"] = {"type": "object", "properties": {}, "required": []}
 
                 tool_dict = {
                     "_id": object_id,
