@@ -60,6 +60,27 @@ class OpenAI(LLMProvider):
         schema = getattr(func, "_openai_parameters", None)
         schema_props  = {}
         schema_req    = []
+            
+        # --- helper: add items={"type":"string"} wherever an array lacks items ---
+        def _patch_array_items_inplace(schema: dict) -> None:
+            if not isinstance(schema, dict):
+                return
+            if schema.get("type") == "array" and "items" not in schema:
+                schema["items"] = {"type": "string"}
+            # descend common schema containers
+            for key in ("properties", "patternProperties", "$defs", "defs"):
+                obj = schema.get(key)
+                if isinstance(obj, dict):
+                    for v in obj.values():
+                        _patch_array_items_inplace(v)
+            for key in ("anyOf", "allOf", "oneOf"):
+                arr = schema.get(key)
+                if isinstance(arr, list):
+                    for v in arr:
+                        _patch_array_items_inplace(v)
+            if isinstance(schema.get("items"), dict):
+                _patch_array_items_inplace(schema["items"])
+        
         if isinstance(schema, dict) and schema.get("type") == "object":
             schema_props = schema.get("properties", {}) or {}
             schema_req   = list(schema.get("required", []) or [])
