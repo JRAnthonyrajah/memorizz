@@ -10,6 +10,7 @@ import inspect
 from .tool_schema import ToolSchemaType
 from bson import ObjectId
 import logging
+import json
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -107,6 +108,9 @@ class Toolbox:
                 return out
 
             param_list = _canonical_param_list_from_fn(f)
+            print("DEBUG schema:", json.dumps(getattr(f, "_openai_parameters", {}), indent=2))
+            print("DEBUG flattened:", json.dumps(param_list, indent=2))
+
 
 
             if augment:
