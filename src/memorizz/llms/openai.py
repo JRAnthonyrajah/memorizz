@@ -49,7 +49,9 @@ class OpenAI(LLMProvider):
         canonical JSON-Schema (if present) and ensure arrays always include `items`.
         Returns the SAME model type as `response.output_parsed`.
         """
-        
+        from ..long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
+        import inspect
+
 
         # ---------- helpers ----------
         def _patch_array_items_inplace(schema: dict) -> None:
