@@ -43,59 +43,60 @@ class OpenAI(LLMProvider):
         }
 
 
-
     def get_tool_metadata(self, func: Callable) -> Dict[str, Any]:
         """
         Use the LLM to enrich docs, but *constrain* parameter names to the canonical
-        JSON-Schema attached by the MCP adapter (func._openai_parameters).
+        JSON-Schema attached by the MCP adapter (func._openai_parameters), and
+        ensure any array types include an 'items' subschema before returning.
         """
         from ..long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
         import inspect, json
+        from typing import Any
 
         docstring  = func.__doc__ or ""
         signature  = str(inspect.signature(func))
         func_name  = func.__name__
 
-        # Pull canonical schema from the MCP adapter (if present)
+        # Pull canonical schema (for prompting constraints only)
         schema = getattr(func, "_openai_parameters", None)
-        schema_props  = {}
-        schema_req    = []
-            
+        schema_props, schema_req = {}, []
+
         # --- helper: add items={"type":"string"} wherever an array lacks items ---
-        def _patch_array_items_inplace(schema: dict) -> None:
-            if not isinstance(schema, dict):
+        def _patch_array_items_inplace(s: Any) -> None:
+            if not isinstance(s, dict):
                 return
-            if schema.get("type") == "array" and "items" not in schema:
-                schema["items"] = {"type": "string"}
+            if s.get("type") == "array" and "items" not in s:
+                s["items"] = {"type": "string"}
             # descend common schema containers
             for key in ("properties", "patternProperties", "$defs", "defs"):
-                obj = schema.get(key)
+                obj = s.get(key)
                 if isinstance(obj, dict):
                     for v in obj.values():
                         _patch_array_items_inplace(v)
             for key in ("anyOf", "allOf", "oneOf"):
-                arr = schema.get(key)
+                arr = s.get(key)
                 if isinstance(arr, list):
                     for v in arr:
                         _patch_array_items_inplace(v)
-            if isinstance(schema.get("items"), dict):
-                _patch_array_items_inplace(schema["items"])
-        
+            if isinstance(s.get("items"), dict):
+                _patch_array_items_inplace(s["items"])
+
         if isinstance(schema, dict) and schema.get("type") == "object":
             schema_props = schema.get("properties", {}) or {}
             schema_req   = list(schema.get("required", []) or [])
 
-        # Prepare a concise schema excerpt for the prompt (names + types + desc)
+        # For the prompt: concise excerpt of canonical params
         def _excerpt(props: dict) -> str:
             rows = []
             for n, spec in props.items():
-                t = (spec.get("type") or "string") if isinstance(spec, dict) else "string"
-                d = (spec.get("description") or "") if isinstance(spec, dict) else ""
-                rows.append(f"- {n} ({t}) {('[required]' if n in schema_req else '')}"
-                            f"{(': ' + d) if d else ''}")
+                if isinstance(spec, dict):
+                    t = spec.get("type") or "string"
+                    d = spec.get("description") or ""
+                else:
+                    t, d = "string", ""
+                rows.append(f"- {n} ({t}) {('[required]' if n in schema_req else '')}{(': ' + d) if d else ''}")
             return "\n".join(rows) or "(none)"
 
-        # A small alias blacklist example to steer the model
         disallowed_example = []
         if "path" in schema_props:
             disallowed_example = [
@@ -103,7 +104,6 @@ class OpenAI(LLMProvider):
                 {"wrong": "filepath",  "right": "path"},
             ]
 
-        # ---- Prompt with hard constraints on parameter names ----
         system_msg = {
             "role": "system",
             "content": (
@@ -112,7 +112,6 @@ class OpenAI(LLMProvider):
             )
         }
 
-        # Build a strict instruction block the model cannot miss
         constraint_block = (
             "CANONICAL PARAMETERS:\n"
             f"{_excerpt(schema_props)}\n\n"
@@ -145,41 +144,74 @@ class OpenAI(LLMProvider):
             )
         }
 
-        # 1) Let the LLM produce the metadata
+        # Ask the LLM using your structured parser
         response = self.client.responses.parse(
             model=self.model,
             input=[system_msg, user_msg],
             text_format=ToolSchemaType
         )
 
-        parsed = response.output_parsed  # keep the same object/type
-        
-        # 1) If there is a nested JSON-Schema at function.parameters, patch it
+        parsed = response.output_parsed  # keep same object/type
+
+        # --- Patch nested JSON-Schema (function.parameters) regardless of container type ---
         try:
             fn = getattr(parsed, "function", None)
+            # Case A: dict-shaped
             if isinstance(fn, dict):
                 params_schema = fn.get("parameters")
                 if isinstance(params_schema, dict):
                     _patch_array_items_inplace(params_schema)
                     fn["parameters"] = params_schema
                     setattr(parsed, "function", fn)
+            else:
+                # Case B: pydantic model or similar
+                # Try to get dict, patch, then set back if possible
+                if hasattr(fn, "model_dump"):
+                    fn_dict = fn.model_dump()
+                    params_schema = fn_dict.get("parameters")
+                    if isinstance(params_schema, dict):
+                        _patch_array_items_inplace(params_schema)
+                        fn_dict["parameters"] = params_schema
+                        # If function is a pydantic model with model_construct or copy(update=...)
+                        if hasattr(fn, "model_copy"):
+                            fn_new = fn.model_copy(update={"parameters": params_schema})
+                            setattr(parsed, "function", fn_new)
+                        else:
+                            # Fallback: set the field directly if present
+                            try:
+                                setattr(fn, "parameters", params_schema)
+                            except Exception:
+                                # As a last resort, replace with the dict form
+                                setattr(parsed, "function", fn_dict)
+                elif isinstance(fn, object) and hasattr(fn, "__dict__"):
+                    # Generic object: try setattr
+                    ps = getattr(fn, "parameters", None)
+                    if isinstance(ps, dict):
+                        _patch_array_items_inplace(ps)
+                        try:
+                            setattr(fn, "parameters", ps)
+                        except Exception:
+                            pass
         except Exception:
-            pass  # never fail metadata generation over a patch
+            # Never fail metadata generation over a patch
+            pass
 
-        # 2) If you also keep a flat parameters list, add items there when missing
+        # --- Optional: patch flat parameter rows if present ---
         try:
             flat = getattr(parsed, "parameters", None)
             if isinstance(flat, list):
                 for p in flat:
                     if isinstance(p, dict) and p.get("type") == "array" and "items" not in p:
                         p["items"] = {"type": "string"}
-                        # optional convenience hint for UIs:
                         p.setdefault("items_type", "string")
         except Exception:
             pass
 
         return parsed
-    
+
+
+
+
     def augment_docstring(self, docstring: str) -> str:
         """
         Augment the docstring with an LLM generated description.
