@@ -127,7 +127,6 @@ class Toolbox:
                     "embedding": embedding,
                     "queries": queries,
                     **tool_data.model_dump(),
-                    "parameters": param_list,
                 }
             else:
                 embedding = get_embedding(f"{f.__name__} {docstring} {signature}")
@@ -139,7 +138,6 @@ class Toolbox:
                     "_id": object_id,
                     "embedding": embedding,
                     **tool_data.model_dump(),
-                    "parameters": param_list,
                 }
             
             self.memory_provider.store(tool_dict, memory_store_type=MemoryType.TOOLBOX)
