@@ -81,14 +81,33 @@ class Toolbox:
             signature = str(inspect.signature(f))
             object_id = ObjectId()
             object_id_str = str(object_id)
+            # NEW: derive canonical parameters from the adapter-attached schema
+            param_list = _canonical_param_list_from_fn(f)
 
 
-            # def _looks_like_json_schema(x: Any) -> bool:
-            #     return isinstance(x, Mapping) and x.get("type") == "object" and "properties" in x
+            # --- canonical parameters extraction/flattening ---
+            def _canonical_param_list_from_fn(f: Callable) -> List[Dict[str, Any]]:
+                """
+                Read the JSON Schema attached by the MCP adapter and flatten it into
+                a stable parameter list that preserves canonical property keys.
+                """
+                schema = getattr(f, "_openai_parameters", None)
+                if not isinstance(schema, dict) or schema.get("type") != "object":
+                    return []
+                props = schema.get("properties", {}) or {}
+                required = set(schema.get("required", []) or [])
+                out: List[Dict[str, Any]] = []
+                for name, spec in props.items():  # ← property key verbatim (no aliasing)
+                    out.append({
+                        "name": name,
+                        "description": spec.get("description", ""),
+                        "type": spec.get("type", "string"),
+                        "required": name in required,
+                    })
+                return out
 
-            # def _sanitize_schema(schema: dict) -> dict:
-            #     # optional: call your normalizer here if available
-            #     return schema
+
+
             if augment:
                 # Use the configured LLM provider for augmentation
                 augmented_docstring = self._augment_docstring(docstring)
@@ -97,47 +116,23 @@ class Toolbox:
                 tool_data = self._get_tool_metadata(f)
                 # tool_data_dict = tool_data.model_dump()  # <<— work on plain dicts
 
-                # runtime_schema = getattr(f, "parameters", None)
-                # if _looks_like_json_schema(runtime_schema):
-                #     tool_data_dict["function"]["parameters"] = _sanitize_schema(runtime_schema)
-                # else:
-                #     prov_params = tool_data_dict["function"].get("parameters")
-                #     if _looks_like_json_schema(prov_params):
-                #         tool_data_dict["function"]["parameters"] = _sanitize_schema(prov_params)
-                #     else:
-                #         log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; defaulting to empty object.", f.__name__)
-                #         tool_data_dict["function"]["parameters"] = {"type": "object", "properties": {}, "required": []}
 
                 tool_dict = {
                     "_id": object_id,
                     "embedding": embedding,
                     "queries": queries,
                     **tool_data.model_dump(),
-                    # include queries if augment=True
-                    # **tool_data_dict,
+                    "parameters": param_list,
                 }
             else:
                 embedding = get_embedding(f"{f.__name__} {docstring} {signature}")
                 tool_data = self._get_tool_metadata(f)
-                # tool_data_dict = tool_data.model_dump()  # <<— work on plain dicts
-
-                # runtime_schema = getattr(f, "parameters", None)
-                # if _looks_like_json_schema(runtime_schema):
-                #     tool_data_dict["function"]["parameters"] = _sanitize_schema(runtime_schema)
-                # else:
-                #     prov_params = tool_data_dict["function"].get("parameters")
-                #     if _looks_like_json_schema(prov_params):
-                #         tool_data_dict["function"]["parameters"] = _sanitize_schema(prov_params)
-                #     else:
-                #         log.warning("[toolbox] Provider parameters for %s are not JSON-Schema; defaulting to empty object.", f.__name__)
-                #         tool_data_dict["function"]["parameters"] = {"type": "object", "properties": {}, "required": []}
 
                 tool_dict = {
                     "_id": object_id,
                     "embedding": embedding,
                     **tool_data.model_dump(),
-                    # include queries if augment=True
-                #     **tool_data_dict,
+                    "parameters": param_list,
                 }
             
             self.memory_provider.store(tool_dict, memory_store_type=MemoryType.TOOLBOX)
