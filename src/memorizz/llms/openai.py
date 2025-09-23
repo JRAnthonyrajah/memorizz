@@ -44,48 +44,85 @@ class OpenAI(LLMProvider):
 
     def get_tool_metadata(self, func: Callable) -> Dict[str, Any]:
         """
-        Get the metadata for a tool.
-
-        Parameters:
-        -----------
-        func : Callable
-            The function to get the metadata for.
-
-        Returns:
-        --------
-        Dict[str, Any]
+        Use the LLM to enrich docs, but *constrain* parameter names to the canonical
+        JSON-Schema attached by the MCP adapter (func._openai_parameters).
         """
-        # We'll import ToolSchemaType here to avoid circular imports
         from ..long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
+        import inspect, json
 
-        docstring = func.__doc__ or ""
-        signature = str(inspect.signature(func))
-        func_name = func.__name__
+        docstring  = func.__doc__ or ""
+        signature  = str(inspect.signature(func))
+        func_name  = func.__name__
 
+        # Pull canonical schema from the MCP adapter (if present)
+        schema = getattr(func, "_openai_parameters", None)
+        schema_props  = {}
+        schema_req    = []
+        if isinstance(schema, dict) and schema.get("type") == "object":
+            schema_props = schema.get("properties", {}) or {}
+            schema_req   = list(schema.get("required", []) or [])
+
+        # Prepare a concise schema excerpt for the prompt (names + types + desc)
+        def _excerpt(props: dict) -> str:
+            rows = []
+            for n, spec in props.items():
+                t = (spec.get("type") or "string") if isinstance(spec, dict) else "string"
+                d = (spec.get("description") or "") if isinstance(spec, dict) else ""
+                rows.append(f"- {n} ({t}) {('[required]' if n in schema_req else '')}"
+                            f"{(': ' + d) if d else ''}")
+            return "\n".join(rows) or "(none)"
+
+        # A small alias blacklist example to steer the model
+        disallowed_example = []
+        if "path" in schema_props:
+            disallowed_example = [
+                {"wrong": "file_path", "right": "path"},
+                {"wrong": "filepath",  "right": "path"},
+            ]
+
+        # ---- Prompt with hard constraints on parameter names ----
         system_msg = {
             "role": "system",
             "content": (
-                "You are an expert metadata augmentation assistant specializing in JSON schema discovery "
-                "and documentation enhancement.\n\n"
-                f"**IMPORTANT**: Use the function name exactly as provided (`{func_name}`) and do NOT rename it."
+                "You are an expert metadata assistant. Follow the caller's canonical JSON-Schema exactly. "
+                "Never rename parameters; never add extra parameters; never omit required ones."
             )
         }
+
+        # Build a strict instruction block the model cannot miss
+        constraint_block = (
+            "CANONICAL PARAMETERS:\n"
+            f"{_excerpt(schema_props)}\n\n"
+            "RULES:\n"
+            "1) Use these names exactly (verbatim). Do not invent or rename.\n"
+            "2) Include all and only these parameters in the 'parameters' array.\n"
+            "3) The 'required' list must match the canonical 'required'.\n"
+            "4) If you were going to use any aliases, replace them with the canonical names.\n"
+        )
+        if disallowed_example:
+            constraint_block += (
+                "EXAMPLES (wrong → right):\n" +
+                "\n".join([f"- {ex['wrong']} → {ex['right']}" for ex in disallowed_example]) +
+                "\n"
+            )
 
         user_msg = {
             "role": "user",
             "content": (
-                f"Generate enriched metadata for the function `{func_name}`.\n\n"
+                f"Generate enriched metadata for `{func_name}`.\n\n"
                 f"- Docstring: {docstring}\n"
                 f"- Signature: {signature}\n\n"
-                "Enhance the metadata by:\n"
-                "• Expanding the docstring into a detailed description.\n"
-                "• Writing clear natural‐language descriptions for each parameter, including type, purpose, and constraints.\n"
-                "• Identifying which parameters are required.\n"
-                "• (Optional) Suggesting example queries or use cases.\n\n"
-                "Produce a JSON object that strictly adheres to the ToolSchemaType structure."
+                "Your job:\n"
+                "• Expand the description.\n"
+                "• Provide clear descriptions for each parameter (using the canonical names).\n"
+                "• Provide example queries (if helpful).\n\n"
+                "Output MUST adhere to ToolSchemaType and the constraints below.\n\n"
+                + constraint_block +
+                "\nIMPORTANT: If the canonical schema is present, you must mirror its parameter names and 'required' exactly."
             )
         }
 
+        # 1) Let the LLM produce the metadata
         response = self.client.responses.parse(
             model=self.model,
             input=[system_msg, user_msg],
