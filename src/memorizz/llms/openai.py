@@ -43,77 +43,69 @@ class OpenAI(LLMProvider):
         }
 
 
+
     def get_tool_metadata(self, func: Callable) -> Dict[str, Any]:
         """
-        Enrich tool docs with the LLM, but constrain parameter names/types to the
-        canonical JSON-Schema (if present) and ensure arrays always include `items`.
-        Returns the SAME model type as `response.output_parsed`.
+        Use the LLM to enrich docs, but *constrain* parameter names to the canonical
+        JSON-Schema attached by the MCP adapter (func._openai_parameters).
         """
         from ..long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
-        import inspect
+        import inspect, json
 
+        docstring  = func.__doc__ or ""
+        signature  = str(inspect.signature(func))
+        func_name  = func.__name__
 
-        # ---------- helpers ----------
-        def _patch_array_items_inplace(schema: dict) -> None:
-            if not isinstance(schema, dict):
-                return
-            if schema.get("type") == "array" and "items" not in schema:
-                schema["items"] = {"type": "string"}
-            for key in ("properties", "patternProperties", "$defs", "defs"):
-                obj = schema.get(key)
-                if isinstance(obj, dict):
-                    for v in obj.values():
-                        _patch_array_items_inplace(v)
-            for key in ("anyOf", "allOf", "oneOf"):
-                arr = schema.get(key)
-                if isinstance(arr, list):
-                    for v in arr:
-                        _patch_array_items_inplace(v)
-            if isinstance(schema.get("items"), dict):
-                _patch_array_items_inplace(schema["items"])
+        # Pull canonical schema from the MCP adapter (if present)
+        schema = getattr(func, "_openai_parameters", None)
+        schema_props  = {}
+        schema_req    = []
+        if isinstance(schema, dict) and schema.get("type") == "object":
+            schema_props = schema.get("properties", {}) or {}
+            schema_req   = list(schema.get("required", []) or [])
 
-        def _schema_excerpt(props: Dict[str, Any], req: list[str]) -> str:
-            lines, req_set = [], set(req or [])
-            for name, spec in (props or {}).items():
+        # Prepare a concise schema excerpt for the prompt (names + types + desc)
+        def _excerpt(props: dict) -> str:
+            rows = []
+            for n, spec in props.items():
                 t = (spec.get("type") or "string") if isinstance(spec, dict) else "string"
                 d = (spec.get("description") or "") if isinstance(spec, dict) else ""
-                if t == "array":
-                    items = spec.get("items") or {"type": "string"}
-                    t = f"array<{items.get('type','object') if isinstance(items, dict) else 'object'}>"
-                lines.append(f"- {name}: {t}{' [required]' if name in req_set else ''}{(': ' + d) if d else ''}")
-            return "\n".join(lines) or "(none)"
+                rows.append(f"- {n} ({t}) {('[required]' if n in schema_req else '')}"
+                            f"{(': ' + d) if d else ''}")
+            return "\n".join(rows) or "(none)"
 
-        # ---------- canonical schema (if MCP attached it) ----------
-        schema = getattr(func, "_openai_parameters", None)
-        has_schema = isinstance(schema, dict) and schema.get("type") == "object"
-        schema_props = schema.get("properties", {}) if has_schema else {}
-        schema_req   = list(schema.get("required", []) or []) if has_schema else []
+        # A small alias blacklist example to steer the model
+        disallowed_example = []
+        if "path" in schema_props:
+            disallowed_example = [
+                {"wrong": "file_path", "right": "path"},
+                {"wrong": "filepath",  "right": "path"},
+            ]
 
-        # ---------- prompt ----------
-        docstring = func.__doc__ or ""
-        signature = str(inspect.signature(func))
-        func_name = func.__name__
-
+        # ---- Prompt with hard constraints on parameter names ----
         system_msg = {
             "role": "system",
             "content": (
-                "You are a rigorous tool metadata assistant. Follow the caller-supplied JSON-Schema exactly. "
-                "Never rename parameters; never invent parameters; never omit required parameters. "
-                "For arrays, use JSON-Schema semantics: arrays MUST specify an `items` schema."
+                "You are an expert metadata assistant. Follow the caller's canonical JSON-Schema exactly. "
+                "Never rename parameters; never add extra parameters; never omit required ones."
             )
         }
 
-        constraints = ""
-        if has_schema:
-            constraints = (
-                "CANONICAL SCHEMA (use these names/types verbatim; arrays include `items`):\n"
-                f"{_schema_excerpt(schema_props, schema_req)}\n\n"
-                "RULES:\n"
-                "1) Use parameter names exactly as above (verbatim).\n"
-                "2) Do not add parameters not listed above.\n"
-                "3) The 'required' list must match the canonical schema.\n"
-                "4) For arrays, do NOT say 'array of X'—use JSON-Schema (`type: array` + `items`).\n"
-                "5) Output must conform to ToolSchemaType."
+        # Build a strict instruction block the model cannot miss
+        constraint_block = (
+            "CANONICAL PARAMETERS:\n"
+            f"{_excerpt(schema_props)}\n\n"
+            "RULES:\n"
+            "1) Use these names exactly (verbatim). Do not invent or rename.\n"
+            "2) Include all and only these parameters in the 'parameters' array.\n"
+            "3) The 'required' list must match the canonical 'required'.\n"
+            "4) If you were going to use any aliases, replace them with the canonical names.\n"
+        )
+        if disallowed_example:
+            constraint_block += (
+                "EXAMPLES (wrong → right):\n" +
+                "\n".join([f"- {ex['wrong']} → {ex['right']}" for ex in disallowed_example]) +
+                "\n"
             )
 
         user_msg = {
@@ -122,114 +114,50 @@ class OpenAI(LLMProvider):
                 f"Generate enriched metadata for `{func_name}`.\n\n"
                 f"- Docstring: {docstring}\n"
                 f"- Signature: {signature}\n\n"
-                "Your tasks:\n"
+                "Your job:\n"
                 "• Expand the description.\n"
-                "• Provide clear descriptions for each parameter (using the canonical names, if given).\n"
-                "• Provide example queries (optional).\n\n"
-                + constraints
+                "• Provide clear descriptions for each parameter (using the canonical names).\n"
+                "• Provide example queries (if helpful).\n\n"
+                "Output MUST adhere to ToolSchemaType and the constraints below.\n\n"
+                + constraint_block +
+                "\nIMPORTANT: If the canonical schema is present, you must mirror its parameter names and 'required' exactly."
             )
         }
 
-        # ---------- LLM call ----------
+        # 1) Let the LLM produce the metadata
         response = self.client.responses.parse(
             model=self.model,
             input=[system_msg, user_msg],
-            text_format=ToolSchemaType  # your existing schema class
+            text_format=ToolSchemaType
         )
-        parsed = response.output_parsed  # usually a Pydantic model
-        # Normalize to a dict for controlled edits
-        if hasattr(parsed, "model_dump"):
-            data = parsed.model_dump()
-        else:
-            # already a dict in some providers
-            data = dict(parsed)
 
-        # ---------- enforce + fix arrays ----------
-        if has_schema:
-            # Ensure canonical schema has items everywhere
-            _patch_array_items_inplace(schema)
-
-            # Build enriched flat parameter list (includes items for arrays)
-            req_set = set(schema_req)
-            # Index any LLM param descriptions by name to enrich when schema lacks one
-            prov_by_name = {}
-            for p in (data.get("parameters") or []):
-                if isinstance(p, dict) and "name" in p:
-                    prov_by_name[str(p["name"]).lower()] = p
-
-            alias_to_canonical = {"file_path": "path", "filepath": "path",
-                                "source": "source_path", "destination": "destination_path"}
-
-            flat_params: List[Dict[str, Any]] = []
-            for canon_name, spec in schema_props.items():
-                if not isinstance(spec, dict):
-                    spec = {}
-                schema_desc = str(spec.get("description", "") or "")
-                prov = prov_by_name.get(canon_name.lower())
-                if prov is None:
-                    # borrow description from alias if present
-                    for prov_nm, rec in prov_by_name.items():
-                        if alias_to_canonical.get(prov_nm) == canon_name:
-                            prov = rec
-                            break
-                prov_desc = str(prov.get("description", "") or "") if isinstance(prov, dict) else ""
-                final_desc = schema_desc if schema_desc else prov_desc
-
-                row = {
-                    "name": canon_name,
-                    "description": final_desc,
-                    "type": spec.get("type", "string"),
-                    "required": canon_name in req_set,
-                }
-                if row["type"] == "array":
-                    items = spec.get("items") or {"type": "string"}
-                    row["items"] = items
-                    row["items_type"] = (items.get("type", "object") if isinstance(items, dict) else "object")
-                flat_params.append(row)
-
-            data["parameters"] = flat_params
-            data["required"]   = list(schema_req)
-
-            # Ensure nested JSON-Schema object is the canonical one
-            fn_block = data.get("function")
-            if isinstance(fn_block, dict):
-                fn_block = dict(fn_block)
-                fn_block["parameters"] = schema
-                data["function"] = fn_block
-
-            # Optional: canonicalize example queries
-            if isinstance(data.get("queries"), list):
-                data["queries"] = [
-                    q.replace("file_path=", "path=").replace("filepath=", "path=") if isinstance(q, str) else q
-                    for q in data["queries"]
-                ]
-        else:
-            # No canonical schema: best-effort repair on LLM's nested schema + flat list
-            fn_block = data.get("function")
-            if isinstance(fn_block, dict):
-                params_schema = fn_block.get("parameters")
+        parsed = response.output_parsed  # keep the same object/type
+        
+        # 1) If there is a nested JSON-Schema at function.parameters, patch it
+        try:
+            fn = getattr(parsed, "function", None)
+            if isinstance(fn, dict):
+                params_schema = fn.get("parameters")
                 if isinstance(params_schema, dict):
                     _patch_array_items_inplace(params_schema)
-                    fn_block = dict(fn_block)
-                    fn_block["parameters"] = params_schema
-                    data["function"] = fn_block
+                    fn["parameters"] = params_schema
+                    setattr(parsed, "function", fn)
+        except Exception:
+            pass  # never fail metadata generation over a patch
 
-            flat = []
-            for p in (data.get("parameters") or []):
-                if not isinstance(p, dict):
-                    continue
-                q = dict(p)
-                if q.get("type") == "array" and "items" not in q:
-                    q["items"] = {"type": "string"}
-                    q["items_type"] = "string"
-                flat.append(q)
-            if flat:
-                data["parameters"] = flat
+        # 2) If you also keep a flat parameters list, add items there when missing
+        try:
+            flat = getattr(parsed, "parameters", None)
+            if isinstance(flat, list):
+                for p in flat:
+                    if isinstance(p, dict) and p.get("type") == "array" and "items" not in p:
+                        p["items"] = {"type": "string"}
+                        # optional convenience hint for UIs:
+                        p.setdefault("items_type", "string")
+        except Exception:
+            pass
 
-        # ---------- return the SAME model type the parser returned ----------
-        OutType = parsed.__class__  # preserves the exact pydantic model class
-        return OutType(**data)
-
+        return parsed
     
     def augment_docstring(self, docstring: str) -> str:
         """
