@@ -132,6 +132,8 @@ class Toolbox:
             else:
                 embedding = get_embedding(f"{f.__name__} {docstring} {signature}")
                 tool_data = self._get_tool_metadata(f)
+                
+                print("DEBUG tool_data:", json.dumps(tool_data, indent=2))
 
                 tool_dict = {
                     "_id": object_id,
