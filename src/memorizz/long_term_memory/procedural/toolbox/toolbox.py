@@ -82,7 +82,7 @@ class Toolbox:
             object_id = ObjectId()
             object_id_str = str(object_id)
             # NEW: derive canonical parameters from the adapter-attached schema
-            param_list = _canonical_param_list_from_fn(f)
+
 
 
             # --- canonical parameters extraction/flattening ---
@@ -106,6 +106,7 @@ class Toolbox:
                     })
                 return out
 
+            param_list = _canonical_param_list_from_fn(f)
 
 
             if augment:
