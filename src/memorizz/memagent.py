@@ -651,82 +651,42 @@ class MemAgent:
         
 
     @staticmethod
-    def _format_tool(tool_meta: Dict[str, Any]) -> Dict[str,Any]:
-        """
-        Format the tool.
-
-        This method formats the tool.
-
-        Parameters:
-            tool_meta (Dict[str, Any]): The tool meta.
-
-        Returns:
-            Dict[str, Any]: The formatted tool.
-        """
-
+    def _format_tool(tool_meta: Dict[str, Any]) -> Dict[str, Any]:
         # Handle different tool metadata structures
-        # Case 1: Tool has proper 'function' metadata structure
         if "function" in tool_meta and isinstance(tool_meta["function"], dict):
             function_data = tool_meta["function"]
             name = function_data.get("name", "unknown_tool")
             description = function_data.get("description", "No description available")
             parameters = function_data.get("parameters", [])
-        # Case 2: Tool has flat structure (name, description, parameters at top level)
         elif "description" in tool_meta:
             name = tool_meta.get("name", "unknown_tool")
             description = tool_meta.get("description", "No description available")
             parameters = tool_meta.get("parameters", [])
-        # Case 3: Tool has corrupted structure with raw function - skip it
-        elif "function" in tool_meta and callable(tool_meta["function"]):
-            logger.warning(f"Skipping tool with _id {tool_meta.get('_id')} - contains raw function instead of metadata")
-            return None
         else:
-            # Fallback for unknown structure
-            logger.warning(f"Unknown tool structure for tool with _id {tool_meta.get('_id')}, using fallback")
-            name = "unknown_tool"
-            description = "Tool metadata corrupted"
-            parameters = []
+            logger.warning(f"Skipping tool with _id {tool_meta.get('_id')} - missing name and function structure")
+            return None
 
-        # Initialize the properties and required parameters
+        # Initialize properties and required parameters
         props, req = {}, []
-
-        # Format the tool parameters
         if isinstance(parameters, list):
             for p in parameters:
                 if not isinstance(p, dict):
                     continue
-                    
-                # Normalize the parameter type for OpenAI API compatibility
-                param_type = p.get("type", "string")
-                
-                # Clean up type string - remove any extra text like "(required)"
-                if isinstance(param_type, str):
-                    param_type = param_type.lower().strip()
-                    # Remove any parenthetical content
-                    if "(" in param_type:
-                        param_type = param_type.split("(")[0].strip()
-                    
-                    # Normalize numeric types to 'number'
-                    if param_type in ["float", "decimal", "double", "numeric", "number"]:
-                        param_type = "number"
-                    elif param_type in ["int", "integer"]:
-                        param_type = "integer"
-                    elif param_type in ["bool", "boolean"]:
-                        param_type = "boolean"
-                    elif param_type in ["str", "text"]:
-                        param_type = "string"
-                    # Default to string if unrecognized
-                    elif param_type not in ["string", "number", "integer", "boolean", "array", "object"]:
-                        param_type = "string"
-                    
-                props[p["name"]] = {
-                    "type": param_type,
+                param_name = p.get("name")
+                if not param_name:
+                    continue
+                # Copy the entire parameter schema, preserving fields like 'items'
+                param_schema = {
+                    "type": p.get("type", "string"),
                     "description": p.get("description", "")
                 }
+                # Include additional fields like 'items' for arrays
+                if p.get("type") == "array" and "items" in p:
+                    param_schema["items"] = p.get("items")
+                props[param_name] = param_schema
                 if p.get("required", False):
-                    req.append(p["name"])
+                    req.append(param_name)
 
-        # Return the formatted tool
         return {
             "type": "function",
             "name": name,
@@ -737,7 +697,6 @@ class MemAgent:
                 "required": req
             }
         }
-        
 
     def _load_tools_from_toolbox(self, query: str):
         """
