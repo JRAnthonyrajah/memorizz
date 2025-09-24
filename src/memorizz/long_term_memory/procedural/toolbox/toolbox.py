@@ -96,35 +96,21 @@ class Toolbox:
             import time
             import inspect
             from bson import ObjectId
+            from pymongo.errors import DuplicateKeyError
+
             from ....embeddings import get_embedding
             from ....enums.memory_type import MemoryType
 
+            # -------- names / signatures / params ----------
             docstring = f.__doc__ or ""
             signature = str(inspect.signature(f))
-            tool_key  = _tool_key(f)          # NEW: normalized key (plain name)
-            legacy_key = _legacy_tool_key(f)  # NEW: legacy key (module:qualname)
 
-            # ---------- schema → canonical params (unchanged) ----------
-            def _canonical_param_list_from_fn(fn: Callable) -> list[dict[str, Any]]:
-                schema = getattr(fn, "_openai_parameters", None)
-                if not isinstance(schema, dict) or schema.get("type") != "object":
-                    return []
-                props = schema.get("properties", {}) or {}
-                required = set(schema.get("required", []) or [])
-                out = []
-                for name, spec in props.items():
-                    out.append({
-                        "name": name,
-                        "description": spec.get("description", ""),
-                        "type": spec.get("type", "string"),
-                        "required": name in required,
-                    })
-                return out
+            tool_key   = _tool_key(f)           # normalized, canonical plain name (e.g., "read_file")
+            legacy_key = _legacy_tool_key(f)    # legacy identifier (e.g., "pkg.module:Class.method")
 
-            param_list = _canonical_param_list_from_fn(f)
-            # -----------------------------------------------------------
 
-            # Build embedding material (your existing helpers)
+
+            # -------- embedding material / metadata ----------
             if augment:
                 augmented_docstring = self._augment_docstring(docstring)
                 queries  = self._generate_queries(augmented_docstring)
@@ -137,70 +123,123 @@ class Toolbox:
 
             h = _content_hash(material, EMBED_MODEL_ID)
 
-            # ---------- MIGRATION-AWARE LOOKUP (key OR legacy_key) ----------
-            existing = (
-                self.memory_provider.retrieve_by_name(tool_key,  memory_store_type=MemoryType.TOOLBOX)
-                or self.memory_provider.retrieve_by_name(legacy_key, memory_store_type=MemoryType.TOOLBOX)
+            # -------- primary lookup path: by hash + model (dedup) ----------
+            existing_by_hash = self.memory_provider.retrieve_by_hash(
+                h, EMBED_MODEL_ID, memory_store_type=MemoryType.TOOLBOX
             )
 
-            # If nothing changed for an existing normalized record, reuse it and return.
-            if existing and existing.get("name") == tool_key \
-            and existing.get("content_hash") == h \
-            and existing.get("embedding_model_id") == EMBED_MODEL_ID:
-                tool_id = str(existing["_id"])
-                self._tools[tool_id] = f  # keep callable in this process
-                return tool_id
+            # Secondary (migration support): by normalized name or legacy name
+            existing_by_name = self.memory_provider.retrieve_by_name(
+                tool_key, memory_store_type=MemoryType.TOOLBOX
+            ) or (
+                legacy_key and self.memory_provider.retrieve_by_name(
+                    legacy_key, memory_store_type=MemoryType.TOOLBOX
+                )
+            )
 
-            # ---------- (RE)EMBED ONLY WHEN NEEDED ----------
-            embedding = get_embedding(material)
+            # Choose the record to treat as "the existing one" (prefer hash match)
+            existing = existing_by_hash or existing_by_name
 
-            # Build the upsert record; if we found a legacy entry, reuse its _id
-            record_id = existing["_id"] if existing and "_id" in existing else ObjectId()
+            # -------- embedding decision: REUSE when hashes match ----------
+            if existing and existing.get("content_hash") == h and \
+            existing.get("embedding_model_id") == EMBED_MODEL_ID and \
+            isinstance(existing.get("embedding"), (list, tuple)) and existing.get("embedding"):
+                embedding = existing["embedding"]           # ← reuse, do NOT recompute
+            else:
+                embedding = None  # compute lazily, only if we insert
 
-            # Preserve any aliases; add old name if we’re migrating
-            aliases = set(existing.get("aliases", [])) if existing else set()
-            if existing and existing.get("name") and existing.get("name") != tool_key:
-                aliases.add(existing["name"])
+            # -------- consolidate aliases / id ----------
+            record_id = existing.get("_id") if existing else ObjectId()
+            aliases = set((existing.get("aliases") or []) if existing else [])
+            # keep any prior name under aliases when renaming to normalized key
+            old_name = (existing.get("name") if existing else None)
+            if old_name and old_name != tool_key:
+                aliases.add(old_name)
             if legacy_key and legacy_key != tool_key:
                 aliases.add(legacy_key)
 
+            # -------- build record shell (without recomputation) ----------
+            # Note: only include embedding if we have it; otherwise we’ll compute before insert
             tool_record = {
                 "_id": record_id,
-                "name": tool_key,                       # ← normalize to plain name
+                "name": tool_key,
                 "aliases": sorted(a for a in aliases if a),
-                "embedding": embedding,
                 "embedding_model_id": EMBED_MODEL_ID,
                 "content_hash": h,
                 "updated_at": time.time(),
-                "parameters": param_list,               # optional: store canonical params
                 **tool_meta.model_dump(),
             }
             if queries is not None:
                 tool_record["queries"] = queries
+            if embedding is not None:
+                tool_record["embedding"] = embedding
 
-            # ---------- UPSERT BY _id (reusing legacy _id when present) ----------
+            coll = self.memory_provider.collection(memory_store_type=MemoryType.TOOLBOX)
+
+            # -------- upsert strategy (concurrency safe) ----------
+            # Case A: we already have a matching doc (by hash or name)
             if existing:
-                # update existing doc in place (keeps the same _id the planner might carry)
+                # If we didn’t have embedding populated (rare), compute once
+                if "embedding" not in tool_record:
+                    tool_record["embedding"] = get_embedding(material)
                 self.memory_provider.update_by_id(record_id, tool_record, memory_store_type=MemoryType.TOOLBOX)
-            else:
-                # first insert
-                self.memory_provider.store(tool_record, memory_store_type=MemoryType.TOOLBOX)
 
-            # keep callable in this process
+            else:
+                # Case B: new record. We want to avoid computing an embedding if someone else is
+                # inserting the same hash concurrently. Two-phase:
+                # 1) Try a **cheap** read by hash again (tiny window close), then compute only if absent.
+                again = self.memory_provider.retrieve_by_hash(h, EMBED_MODEL_ID, memory_store_type=MemoryType.TOOLBOX)
+                if again:
+                    # someone else won the race — reuse their embedding and _id
+                    record_id = again["_id"]
+                    tool_record["_id"] = record_id
+                    tool_record["embedding"] = again.get("embedding")
+                    tool_record["aliases"] = sorted(set(tool_record["aliases"]) | set(again.get("aliases", [])))
+                    tool_record["name"] = tool_key  # may update name; keep their _id
+                    self.memory_provider.update_by_id(record_id, tool_record, memory_store_type=MemoryType.TOOLBOX)
+                else:
+                    # 2) Compute once and attempt insert; if duplicate, re-read and reuse
+                    if "embedding" not in tool_record:
+                        tool_record["embedding"] = get_embedding(material)
+                    try:
+                        self.memory_provider.store(tool_record, memory_store_type=MemoryType.TOOLBOX)
+                    except DuplicateKeyError:
+                        # Another writer inserted the same (model_id, hash) between compute and insert
+                        winner = self.memory_provider.retrieve_by_hash(h, EMBED_MODEL_ID, memory_store_type=MemoryType.TOOLBOX)
+                        if not winner:
+                            # Extremely rare; fall back to name
+                            winner = self.memory_provider.retrieve_by_name(tool_key, memory_store_type=MemoryType.TOOLBOX)
+                        if winner:
+                            record_id = winner["_id"]
+                            # Optionally merge aliases and normalized name
+                            merged_aliases = sorted(set((winner.get("aliases") or [])) | set(tool_record["aliases"]))
+                            patch = {
+                                "name": tool_key,
+                                "aliases": merged_aliases,
+                                "updated_at": time.time(),
+                            }
+                            self.memory_provider.update_by_id(record_id, patch, memory_store_type=MemoryType.TOOLBOX)
+                        else:
+                            # last resort – rethrow so you see it in logs
+                            raise
+
+            # keep callable in this process for runtime dispatch
             tool_id = str(record_id)
             self._tools[tool_id] = f
 
-            # (Optional) log a concise summary if you have a logger on this class
+            # optional logging
             logger = getattr(self, "logger", None)
             if logger:
                 logger.debug(
                     "[toolbox] upserted tool name=%s id=%s (aliases=%s)",
-                    tool_key, tool_id, ",".join(tool_record["aliases"])
+                    tool_key, tool_id, ",".join(tool_record.get("aliases", []))
                 )
 
             return tool_id
 
         return decorator if func is None else decorator(func)
+
+
 
 
 

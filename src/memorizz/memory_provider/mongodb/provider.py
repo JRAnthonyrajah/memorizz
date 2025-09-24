@@ -254,22 +254,6 @@ class MongoDBProvider(MemoryProvider):
                 )
             
     def store(self, data: Dict[str, Any], memory_store_type: MemoryType) -> str:
-        """
-        Store data in MongoDB using only _id field as primary key.
-        
-        Parameters:
-        -----------
-        data : Dict[str, Any]
-            The document to be stored.
-        memory_store_type : MemoryType
-            The type of memory store (e.g., "persona", "toolbox", etc.)
-        
-        Returns:
-        --------
-        str
-            The ID of the inserted/updated document (MongoDB _id).
-        """
-        # Get the appropriate collection based on memory type
         collection = None
         if memory_store_type == MemoryType.PERSONAS:
             collection = self.persona_collection
@@ -279,7 +263,7 @@ class MongoDBProvider(MemoryProvider):
             collection = self.workflow_memory_collection
         elif memory_store_type == MemoryType.SHORT_TERM_MEMORY:
             collection = self.short_term_memory_collection
-        elif memory_store_type == MemoryType.LONG_TERM_MEMORY:
+        elif memory_store_type == MemoryType.LONG_TERM_MEMORY: 
             collection = self.long_term_memory_collection
         elif memory_store_type == MemoryType.CONVERSATION_MEMORY:
             collection = self.conversation_memory_collection
@@ -293,51 +277,43 @@ class MongoDBProvider(MemoryProvider):
         if collection is None:
             raise ValueError(f"Invalid memory store type: {memory_store_type}")
 
-        # Clean data by removing custom ID fields - only use MongoDB _id
-        # Note: conversation_id is preserved for CONVERSATION_MEMORY as it serves a functional purpose
-        data_copy = data.copy()
-        
-        # Remove custom ID fields since we only want to use _id
-        custom_id_fields = [
-            "persona_id", "tool_id", "workflow_id", "short_term_memory_id", 
-            "agent_id"
-        ]
-        
-        # Don't remove conversation_id for conversation memory
+        data_copy = dict(data)
+
+        # Strip only legacy surrogate ids that you never use for querying
+        legacy_id_fields = {
+            "persona_id", "tool_id", "workflow_id", "short_term_memory_id",
+        }
+        # Keep conversation_id for CONVERSATION_MEMORY; remove otherwise
         if memory_store_type != MemoryType.CONVERSATION_MEMORY:
-            custom_id_fields.append("conversation_id")
-            
-        # Don't remove long_term_memory_id for long-term memory as it's needed for knowledge linking
+            legacy_id_fields.add("conversation_id")
+        # Keep long_term_memory_id for LONG_TERM_MEMORY; remove otherwise
         if memory_store_type != MemoryType.LONG_TERM_MEMORY:
-            custom_id_fields.append("long_term_memory_id")
-        
-        # Don't remove agent_id and memory_id for semantic cache as they're needed for filtering and scoping
+            legacy_id_fields.add("long_term_memory_id")
+        # Keep agent_id + memory_id for SEMANTIC_CACHE to support filters
         if memory_store_type == MemoryType.SEMANTIC_CACHE:
-            # Remove agent_id from the removal list to preserve it (we used this for scoped agents semantic cache)
-            custom_id_fields = [field for field in custom_id_fields if field != "agent_id"]
-            # Don't add memory_id to removal list for semantic cache
+            pass
         elif memory_store_type == MemoryType.CONVERSATION_MEMORY:
-            # Don't remove memory_id for conversation memory as it's needed for conversation history retrieval
-            pass  # Keep memory_id for conversation memory
+            # keep memory_id to scope retrieval
+            pass
         else:
-            # For all other memory types, remove memory_id as before
-            custom_id_fields.append("memory_id")
-            
-        for field in custom_id_fields:
-            data_copy.pop(field, None)
-        
-        # If document has MongoDB _id, update it
+            legacy_id_fields.add("memory_id")
+            legacy_id_fields.add("agent_id")
+
+        for f in legacy_id_fields:
+            data_copy.pop(f, None)
+
         if "_id" in data_copy:
-            result = collection.update_one(
-                {"_id": data_copy["_id"]},
-                {"$set": data_copy},
-                upsert=True
-            )
-            return str(data_copy["_id"])
+            oid = data_copy["_id"] if isinstance(data_copy["_id"], ObjectId) else ObjectId(data_copy["_id"])
+            # Do not try to set _id in payload
+            payload = dict(data_copy)
+            payload.pop("_id", None)
+            collection.update_one({"_id": oid}, {"$set": payload}, upsert=True)
+            return str(oid)
         else:
-            # For new documents, let MongoDB generate _id automatically
             result = collection.insert_one(data_copy)
             return str(result.inserted_id)
+
+
 
     def retrieve_by_query(self, query: Union[Dict[str, Any], str], memory_store_type: MemoryType, limit: int = 1, include_embedding: bool = False, **kwargs) -> Optional[Dict[str, Any]]:
         """
@@ -476,6 +452,18 @@ class MongoDBProvider(MemoryProvider):
         elif memory_store_type == MemoryType.SUMMARIES:
             return self.summaries_collection.find_one({"name": name}, projection)
         
+
+
+    def retrieve_by_hash(self, content_hash: str, model_id: str, *, memory_store_type: MemoryType, include_embedding: bool = False) -> Optional[Dict[str, Any]]:
+        projection = {} if include_embedding else {"embedding": 0}
+        if memory_store_type != MemoryType.TOOLBOX:
+            raise ValueError("retrieve_by_hash is only defined for TOOLBOX in this provider")
+
+        return self.toolbox_collection.find_one(
+            {"content_hash": content_hash, "embedding_model_id": model_id},
+            projection=projection
+        )
+
 
 
     def retrieve_persona_by_query(self, query: Dict[str, Any], limit: int = 1) -> Optional[Dict[str, Any]]:
@@ -890,7 +878,30 @@ class MongoDBProvider(MemoryProvider):
         except Exception as e:
             logger.warning(f"Failed to update cache entry usage: {e}")
             return False
-    
+
+
+
+    def collection(self, *, memory_store_type: MemoryType):
+        mapping = {
+            MemoryType.PERSONAS: self.persona_collection,
+            MemoryType.TOOLBOX: self.toolbox_collection,
+            MemoryType.WORKFLOW_MEMORY: self.workflow_memory_collection,
+            MemoryType.SHORT_TERM_MEMORY: self.short_term_memory_collection,
+            MemoryType.LONG_TERM_MEMORY: self.long_term_memory_collection,
+            MemoryType.CONVERSATION_MEMORY: self.conversation_memory_collection,
+            MemoryType.SHARED_MEMORY: self.shared_memory_collection,
+            MemoryType.SUMMARIES: self.summaries_collection,
+            MemoryType.SEMANTIC_CACHE: self.semantic_cache_collection,
+        }
+        coll = mapping.get(memory_store_type)
+        if coll is None:
+            raise ValueError(f"No collection for: {memory_store_type}")
+        return coll
+
+
+
+
+
     def clear_semantic_cache(self, agent_id: Optional[str] = None, 
                            memory_id: Optional[str] = None) -> int:
         """
@@ -1072,25 +1083,8 @@ class MongoDBProvider(MemoryProvider):
             logger.warning(f"Unsupported memory store type for list_all: {memory_store_type}")
             return []
         
-    def update_by_id(self, id: str, data: Dict[str, Any], memory_store_type: MemoryType) -> bool:
-        """
-        Update a document in a memory store type in MongoDB by _id.
 
-        Parameters:
-        -----------
-        id : str
-            The MongoDB _id of the document to update.
-        data : Dict[str, Any]
-            The data to update the document with.
-        memory_store_type : MemoryType
-            The type of memory store (e.g., "persona", "toolbox", etc.)
-        
-        Returns:
-        --------
-        bool
-            True if update was successful, False otherwise.
-        """
-        # Get the appropriate collection
+    def update_by_id(self, id: str, data: Dict[str, Any], memory_store_type: MemoryType) -> bool:
         collection_mapping = {
             MemoryType.PERSONAS: self.persona_collection,
             MemoryType.TOOLBOX: self.toolbox_collection,
@@ -1100,28 +1094,31 @@ class MongoDBProvider(MemoryProvider):
             MemoryType.CONVERSATION_MEMORY: self.conversation_memory_collection,
             MemoryType.SHARED_MEMORY: self.shared_memory_collection,
             MemoryType.SUMMARIES: self.summaries_collection,
-            MemoryType.SEMANTIC_CACHE: self.semantic_cache_collection
+            MemoryType.SEMANTIC_CACHE: self.semantic_cache_collection,
         }
-        
         collection = collection_mapping.get(memory_store_type)
         if collection is None:
             logger.error(f"No collection mapping found for memory store type: {memory_store_type}")
             return False
-            
-        # Update using MongoDB _id only
+
         try:
-            if ObjectId.is_valid(id):
-                result = collection.update_one({"_id": ObjectId(id)}, {"$set": data})
-                success = result.modified_count > 0
-                if not success:
-                    logger.warning(f"Update operation found no documents to modify for id: {id}")
-                return success
-            else:
+            # Normalize id
+            oid = ObjectId(id) if ObjectId.is_valid(id) else None
+            if not oid:
                 logger.error(f"Invalid ObjectId: {id}")
                 return False
+
+            # Never try to overwrite _id
+            data = dict(data)
+            data.pop("_id", None)
+
+            res = collection.update_one({"_id": oid}, {"$set": data})
+            # Success if we matched any doc (even if nothing actually changed)
+            return res.matched_count > 0
         except Exception as e:
             logger.error(f"Error updating document with id {id}: {e}", exc_info=True)
             return False
+
             
             
     def update_toolbox_item(self, id: str, data: Dict[str, Any]) -> bool:
