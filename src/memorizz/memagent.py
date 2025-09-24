@@ -670,6 +670,7 @@ class MemAgent:
             for p in parameters:
                 if not isinstance(p, dict) or not p.get("name"):
                     continue
+                param_name = p.get("name")
                 param_type = p.get("type", "string").lower().strip()
                 if "(" in param_type:
                     param_type = param_type.split("(")[0].strip()
@@ -684,18 +685,19 @@ class MemAgent:
                 elif param_type not in ["string", "number", "integer", "boolean", "array", "object"]:
                     param_type = "string"
 
+                # Preserve all fields in the parameter schema
                 param_schema = {
                     "type": param_type,
                     "description": p.get("description", "")
                 }
-                if param_type == "array" and "items" in p:
-                    param_schema["items"] = p.get("items")
-                for key in ["enum", "default"]:
+                # Copy additional fields like 'items', 'enum', 'default'
+                for key in ["items", "enum", "default"]:
                     if key in p:
                         param_schema[key] = p.get(key)
-                props[p["name"]] = param_schema
+
+                props[param_name] = param_schema
                 if p.get("required", False):
-                    req.append(p["name"])
+                    req.append(param_name)
 
         formatted_tool = {
             "type": "function",
