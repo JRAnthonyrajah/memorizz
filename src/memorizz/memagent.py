@@ -816,6 +816,8 @@ class MemAgent:
                                 param_type = "boolean"
                             elif param_type in ["str", "text"]:
                                 param_type = "string"
+                            elif param_type in ["list", "array"]:
+                                param_type = "array"
                             # Default to string if unrecognized
                             elif param_type not in ["string", "number", "integer", "boolean", "array", "object"]:
                                 param_type = "string"
@@ -824,6 +826,8 @@ class MemAgent:
                             "type": param_type,
                             "description": param.get("description", "")
                         }
+                        if param_type == "array":
+                            properties[param_name]["items"] = param.get("items", {"type": "string"})  # Default items if missing
                         if param.get("required", False):
                             required.append(param_name)
                     
