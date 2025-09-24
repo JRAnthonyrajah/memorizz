@@ -652,7 +652,6 @@ class MemAgent:
 
     @staticmethod
     def _format_tool(tool_meta: Dict[str, Any]) -> Dict[str, Any]:
-        # Handle different tool metadata structures
         if "function" in tool_meta and isinstance(tool_meta["function"], dict):
             function_data = tool_meta["function"]
             name = function_data.get("name", "unknown_tool")
@@ -666,44 +665,37 @@ class MemAgent:
             logger.warning(f"Skipping tool with _id {tool_meta.get('_id')} - missing name and function structure")
             return None
 
-        # Initialize properties and required parameters
         props, req = {}, []
         if isinstance(parameters, list):
             for p in parameters:
-                if not isinstance(p, dict):
+                if not isinstance(p, dict) or not p.get("name"):
                     continue
-                param_name = p.get("name")
-                if not param_name:
-                    continue
-                # Normalize the parameter type
-                param_type = p.get("type", "string")
-                if isinstance(param_type, str):
-                    param_type = param_type.lower().strip()
-                    if "(" in param_type:
-                        param_type = param_type.split("(")[0].strip()
-                    if param_type in ["float", "decimal", "double", "numeric", "number"]:
-                        param_type = "number"
-                    elif param_type in ["int", "integer"]:
-                        param_type = "integer"
-                    elif param_type in ["bool", "boolean"]:
-                        param_type = "boolean"
-                    elif param_type in ["str", "text"]:
-                        param_type = "string"
-                    elif param_type not in ["string", "number", "integer", "boolean", "array", "object"]:
-                        param_type = "string"
-                
-                # Create parameter schema, preserving all fields
+                param_type = p.get("type", "string").lower().strip()
+                if "(" in param_type:
+                    param_type = param_type.split("(")[0].strip()
+                if param_type in ["float", "decimal", "double", "numeric", "number"]:
+                    param_type = "number"
+                elif param_type in ["int", "integer"]:
+                    param_type = "integer"
+                elif param_type in ["bool", "boolean"]:
+                    param_type = "boolean"
+                elif param_type in ["str", "text"]:
+                    param_type = "string"
+                elif param_type not in ["string", "number", "integer", "boolean", "array", "object"]:
+                    param_type = "string"
+
                 param_schema = {
                     "type": param_type,
                     "description": p.get("description", "")
                 }
-                # Preserve additional fields like 'items' for arrays
                 if param_type == "array" and "items" in p:
                     param_schema["items"] = p.get("items")
-                
-                props[param_name] = param_schema
+                for key in ["enum", "default"]:
+                    if key in p:
+                        param_schema[key] = p.get(key)
+                props[p["name"]] = param_schema
                 if p.get("required", False):
-                    req.append(param_name)
+                    req.append(p["name"])
 
         formatted_tool = {
             "type": "function",
@@ -716,6 +708,8 @@ class MemAgent:
             }
         }
         logger.debug(f"[Formatted tool {name}] {json.dumps(formatted_tool, indent=2)}")
+        if "_id" in tool_meta:
+            formatted_tool["_id"] = str(tool_meta["_id"])
         return formatted_tool
 
 
