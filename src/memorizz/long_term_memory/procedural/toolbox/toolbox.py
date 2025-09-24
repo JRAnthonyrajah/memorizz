@@ -11,6 +11,9 @@ from .tool_schema import ToolSchemaType
 from bson import ObjectId
 import logging
 import json
+import hashlib, time
+from dataclasses import asdict
+
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -31,6 +34,27 @@ def get_openai_default() -> LLMProvider:
     from ....llms.openai import OpenAI
     return OpenAI()
 
+
+
+EMBED_MODEL_ID = "text-embedding-3-small@1.0"  # or whatever you use
+
+def _tool_key(func) -> str:
+    mod = getattr(func, "__module__", "")
+    qual = getattr(func, "__qualname__", getattr(func, "__name__", ""))
+    return f"{mod}:{qual}"
+
+def _material_for_embedding(func, docstring: str, signature: str, queries: list[str] | None) -> str:
+    parts = [func.__name__, docstring, signature]
+    if queries:
+        parts.extend(queries)
+    return " || ".join(parts)
+
+def _content_hash(material: str, embed_model_id: str) -> str:
+    h = hashlib.sha256()
+    h.update(embed_model_id.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(material.encode("utf-8"))
+    return h.hexdigest()
 # ------------------ Step 3: Refactor the Toolbox Class ------------------
 
 class Toolbox:
@@ -80,8 +104,7 @@ class Toolbox:
         def decorator(f: Callable) -> str:
             docstring = f.__doc__ or ""
             signature = str(inspect.signature(f))
-            object_id = ObjectId()
-            object_id_str = str(object_id)
+            tool_key = _tool_key(f)
             # NEW: derive canonical parameters from the adapter-attached schema
 
 
@@ -108,45 +131,58 @@ class Toolbox:
                 return out
 
             param_list = _canonical_param_list_from_fn(f)
-            print("DEBUG schema:", json.dumps(getattr(f, "_openai_parameters", {}), indent=2))
-            print("DEBUG flattened:", json.dumps(param_list, indent=2))
-
-
-
+            
+            
             if augment:
                 # Use the configured LLM provider for augmentation
                 augmented_docstring = self._augment_docstring(docstring)
                 queries = self._generate_queries(augmented_docstring)
-                embedding = get_embedding(f"{f.__name__} {augmented_docstring} {signature} {queries}")
+                material = _material_for_embedding(f, augmented_docstring, signature, queries)
                 tool_data = self._get_tool_metadata(f)
-                # tool_data_dict = tool_data.model_dump()  # <<— work on plain dicts
-
-
-                tool_dict = {
-                    "_id": object_id,
-                    "embedding": embedding,
-                    "queries": queries,
-                    **tool_data.model_dump(),
-                }
             else:
-                embedding = get_embedding(f"{f.__name__} {docstring} {signature}")
+                material = _material_for_embedding(f, docstring, signature, None)
+                queries = None
                 tool_data = self._get_tool_metadata(f)
                 
-                print("DEBUG tool_data:", tool_data)
+            h = _content_hash(material, EMBED_MODEL_ID)
+            existing = self.memory_provider.retrieve_by_name(tool_key, memory_store_type=MemoryType.TOOLBOX)
 
-                tool_dict = {
-                    "_id": object_id,
-                    "embedding": embedding,
-                    **tool_data.model_dump(),
-                }
             
-            self.memory_provider.store(tool_dict, memory_store_type=MemoryType.TOOLBOX)
-            self._tools[object_id_str] = f
-            return object_id_str
 
-        if func is None:
-            return decorator
-        return decorator(func)
+            if existing and existing.get("content_hash") == h and existing.get("embedding_model_id") == EMBED_MODEL_ID:
+                # No change → do not recompute or insert
+                tool_id = str(existing["_id"])
+                self._tools[tool_id] = f
+                return tool_id
+
+            # Changed or new → (re)embed & upsert
+            embedding = get_embedding(material)
+
+            tool_record = {
+                # Keep existing _id if present to avoid churn
+                "_id": existing["_id"] if existing and "_id" in existing else ObjectId(),
+                "name": tool_key,
+                "embedding": embedding,
+                "embedding_model_id": EMBED_MODEL_ID,
+                "content_hash": h,
+                "updated_at": time.time(),
+                **tool_data.model_dump(),
+            }
+            if queries is not None:
+                tool_record["queries"] = queries
+
+            # Upsert by name (tool_key)
+            if existing:
+                self.memory_provider.update_by_id(tool_record["_id"], tool_record, memory_store_type=MemoryType.TOOLBOX)
+                tool_id = str(tool_record["_id"])
+            else:
+                self.memory_provider.store(tool_record, memory_store_type=MemoryType.TOOLBOX)
+                tool_id = str(tool_record["_id"])
+
+            self._tools[tool_id] = f
+            return tool_id
+
+        return decorator if func is None else decorator(func)
 
     def replace_function_by_id(self, tool_id: str, func: Callable) -> bool:
             """Replace the callable function for a tool by its ID."""
