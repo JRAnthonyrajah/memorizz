@@ -38,24 +38,15 @@ def get_openai_default() -> LLMProvider:
 
 EMBED_MODEL_ID = "text-embedding-3-small@1.0"  # or whatever you use
 
-
 def _tool_key(f) -> str:
-    """
-    Produce a stable, *unique per tool* key.
-    - Prefer f.__name__ (MCP wrappers set this to the tool name).
-    - Avoid __qualname__ for wrapped closures ("...<locals>._runner_sync").
-    - Optionally incorporate an MCP-provided title if available.
-    """
-    mod  = getattr(f, "__module__", "") or ""
-    name = getattr(f, "__name__", None) or getattr(f, "__qualname__", "")
-    # If adapter attached a descriptive title, you can include it to be extra safe:
-    schema = getattr(f, "_openai_parameters", None)
-    title  = (schema or {}).get("title") if isinstance(schema, dict) else None
+    # Keep it simple and stable: the actual tool name
+    return getattr(f, "__name__", "")
 
-    if title and title != name:
-        return f"{mod}:{name}:{title}"
-    return f"{mod}:{name}"
-
+def _legacy_tool_key(f: Callable) -> str:
+    """Previous key format you used (module:qualname)."""
+    mod = getattr(f, "__module__", "")
+    qn  = getattr(f, "__qualname__", "")
+    return f"{mod}:{qn}".strip(":")
 
 def _material_for_embedding(func, docstring: str, signature: str, queries: list[str] | None) -> str:
     parts = [func.__name__, docstring, signature]
@@ -101,25 +92,26 @@ class Toolbox:
 
 
     def register_tool(self, func: Optional[Callable] = None, augment: bool = False) -> Union[str, Callable]:
-        """
-        Register a function as a tool in the toolbox.
-        """
         def decorator(f: Callable) -> str:
-            t0 = time.perf_counter()
+            import time
+            import inspect
+            from bson import ObjectId
+            from ....embeddings import get_embedding
+            from ....enums.memory_type import MemoryType
+
             docstring = f.__doc__ or ""
             signature = str(inspect.signature(f))
-            tool_key = _tool_key(f)
-            log.debug("[toolbox] registering tool: key=%s func=%s augment=%s", tool_key, getattr(f, "__name__", f), augment)
+            tool_key  = _tool_key(f)          # NEW: normalized key (plain name)
+            legacy_key = _legacy_tool_key(f)  # NEW: legacy key (module:qualname)
 
-            # --- canonical parameters extraction/flattening ---
-            def _canonical_param_list_from_fn(f: Callable) -> List[Dict[str, Any]]:
-                schema = getattr(f, "_openai_parameters", None)
+            # ---------- schema → canonical params (unchanged) ----------
+            def _canonical_param_list_from_fn(fn: Callable) -> list[dict[str, Any]]:
+                schema = getattr(fn, "_openai_parameters", None)
                 if not isinstance(schema, dict) or schema.get("type") != "object":
-                    log.debug("[toolbox] no _openai_parameters found for %s", tool_key)
                     return []
                 props = schema.get("properties", {}) or {}
                 required = set(schema.get("required", []) or [])
-                out: List[Dict[str, Any]] = []
+                out = []
                 for name, spec in props.items():
                     out.append({
                         "name": name,
@@ -127,87 +119,85 @@ class Toolbox:
                         "type": spec.get("type", "string"),
                         "required": name in required,
                     })
-                log.debug("[toolbox] extracted %d canonical params for %s", len(out), tool_key)
                 return out
 
             param_list = _canonical_param_list_from_fn(f)
-            if param_list:
-                log.trace if hasattr(log, "trace") else log.debug  # no-op if no TRACE level
-                log.debug("[toolbox] params(%s)=%s", tool_key, param_list)
+            # -----------------------------------------------------------
 
-            # ---- material + metadata (augmentation optional) ----
+            # Build embedding material (your existing helpers)
             if augment:
-                log.debug("[toolbox] augmenting docstring for %s", tool_key)
                 augmented_docstring = self._augment_docstring(docstring)
-                queries = self._generate_queries(augmented_docstring)
+                queries  = self._generate_queries(augmented_docstring)
                 material = _material_for_embedding(f, augmented_docstring, signature, queries)
-                tool_data = self._get_tool_metadata(f)
-                log.debug("[toolbox] augmentation produced %d queries for %s", len(queries or []), tool_key)
+                tool_meta = self._get_tool_metadata(f)
             else:
-                queries = None
+                queries  = None
                 material = _material_for_embedding(f, docstring, signature, None)
-                tool_data = self._get_tool_metadata(f)
+                tool_meta = self._get_tool_metadata(f)
 
-            # ---- hash / existing lookup ----
             h = _content_hash(material, EMBED_MODEL_ID)
-            existing = self.memory_provider.retrieve_by_name(tool_key, memory_store_type=MemoryType.TOOLBOX)
-            if existing:
-                log.debug("[toolbox] existing record found for %s (_id=%s)", tool_key, existing.get("_id"))
-            else:
-                log.debug("[toolbox] no existing record for %s; creating new", tool_key)
 
-            # ---- unchanged fast-path ----
-            if existing and existing.get("content_hash") == h and existing.get("embedding_model_id") == EMBED_MODEL_ID:
+            # ---------- MIGRATION-AWARE LOOKUP (key OR legacy_key) ----------
+            existing = (
+                self.memory_provider.retrieve_by_name(tool_key,  memory_store_type=MemoryType.TOOLBOX)
+                or self.memory_provider.retrieve_by_name(legacy_key, memory_store_type=MemoryType.TOOLBOX)
+            )
+
+            # If nothing changed for an existing normalized record, reuse it and return.
+            if existing and existing.get("name") == tool_key \
+            and existing.get("content_hash") == h \
+            and existing.get("embedding_model_id") == EMBED_MODEL_ID:
                 tool_id = str(existing["_id"])
-                self._tools[tool_id] = f  # rebind callable in this process
-                dt = (time.perf_counter() - t0) * 1000
-                log.info("[toolbox] ✓ reused tool (no re-embed): %s (_id=%s) in %.1f ms", tool_key, tool_id, dt)
-                log.debug("[toolbox] totals: in_memory=%d stored≈%s",
-                        len(self._tools), getattr(self, "memory_provider", None) and "?" )
+                self._tools[tool_id] = f  # keep callable in this process
                 return tool_id
 
-            # ---- changed/new → embed & upsert ----
-            e0 = time.perf_counter()
+            # ---------- (RE)EMBED ONLY WHEN NEEDED ----------
             embedding = get_embedding(material)
-            e_dt = (time.perf_counter() - e0) * 1000
-            emb_dim = len(embedding) if hasattr(embedding, "__len__") else "?"
-            log.info("[toolbox] embedding computed for %s: dim=%s in %.1f ms", tool_key, emb_dim, e_dt)
+
+            # Build the upsert record; if we found a legacy entry, reuse its _id
+            record_id = existing["_id"] if existing and "_id" in existing else ObjectId()
+
+            # Preserve any aliases; add old name if we’re migrating
+            aliases = set(existing.get("aliases", [])) if existing else set()
+            if existing and existing.get("name") and existing.get("name") != tool_key:
+                aliases.add(existing["name"])
+            if legacy_key and legacy_key != tool_key:
+                aliases.add(legacy_key)
 
             tool_record = {
-                "_id": existing["_id"] if existing and "_id" in existing else ObjectId(),
-                "name": tool_key,
+                "_id": record_id,
+                "name": tool_key,                       # ← normalize to plain name
+                "aliases": sorted(a for a in aliases if a),
                 "embedding": embedding,
                 "embedding_model_id": EMBED_MODEL_ID,
                 "content_hash": h,
                 "updated_at": time.time(),
-                **tool_data.model_dump(),
-                # optional diagnostics (won't affect search if your schema ignores them):
-                "diagnostics": {
-                    "signature": signature,
-                    "param_list": param_list,
-                    "augment": bool(augment),
-                    "queries_count": len(queries or []),
-                },
+                "parameters": param_list,               # optional: store canonical params
+                **tool_meta.model_dump(),
             }
             if queries is not None:
                 tool_record["queries"] = queries
 
+            # ---------- UPSERT BY _id (reusing legacy _id when present) ----------
             if existing:
-                self.memory_provider.update_by_id(tool_record["_id"], tool_record, memory_store_type=MemoryType.TOOLBOX)
-                tool_id = str(tool_record["_id"])
-                log.info("[toolbox] ↑ updated tool: %s (_id=%s)", tool_key, tool_id)
+                # update existing doc in place (keeps the same _id the planner might carry)
+                self.memory_provider.update_by_id(record_id, tool_record, memory_store_type=MemoryType.TOOLBOX)
             else:
+                # first insert
                 self.memory_provider.store(tool_record, memory_store_type=MemoryType.TOOLBOX)
-                tool_id = str(tool_record["_id"])
-                log.info("[toolbox] + inserted tool: %s (_id=%s)", tool_key, tool_id)
 
+            # keep callable in this process
+            tool_id = str(record_id)
             self._tools[tool_id] = f
-            dt = (time.perf_counter() - t0) * 1000
-            try:
-                stored_count = len(self.list_tools())
-            except Exception:
-                stored_count = "?"
-            log.debug("[toolbox] totals after register: in_memory=%d stored=%s (%.1f ms)", len(self._tools), stored_count, dt)
+
+            # (Optional) log a concise summary if you have a logger on this class
+            logger = getattr(self, "logger", None)
+            if logger:
+                logger.debug(
+                    "[toolbox] upserted tool name=%s id=%s (aliases=%s)",
+                    tool_key, tool_id, ",".join(tool_record["aliases"])
+                )
+
             return tool_id
 
         return decorator if func is None else decorator(func)
