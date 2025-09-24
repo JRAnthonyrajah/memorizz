@@ -1226,6 +1226,7 @@ class MemAgent:
         for step in range(self.max_steps):
             # a) Build function schema list
             tool_metas, tool_choice = self._prepare_tools(query, tool_choice)
+            print(f"[API payload tools] {json.dumps(tool_metas, indent=2, default=str)}")
 
             # b) Call the LLM API using the configured model
             response = self.model.client.responses.create(
