@@ -38,10 +38,24 @@ def get_openai_default() -> LLMProvider:
 
 EMBED_MODEL_ID = "text-embedding-3-small@1.0"  # or whatever you use
 
-def _tool_key(func) -> str:
-    mod = getattr(func, "__module__", "")
-    qual = getattr(func, "__qualname__", getattr(func, "__name__", ""))
-    return f"{mod}:{qual}"
+
+def _tool_key(f) -> str:
+    """
+    Produce a stable, *unique per tool* key.
+    - Prefer f.__name__ (MCP wrappers set this to the tool name).
+    - Avoid __qualname__ for wrapped closures ("...<locals>._runner_sync").
+    - Optionally incorporate an MCP-provided title if available.
+    """
+    mod  = getattr(f, "__module__", "") or ""
+    name = getattr(f, "__name__", None) or getattr(f, "__qualname__", "")
+    # If adapter attached a descriptive title, you can include it to be extra safe:
+    schema = getattr(f, "_openai_parameters", None)
+    title  = (schema or {}).get("title") if isinstance(schema, dict) else None
+
+    if title and title != name:
+        return f"{mod}:{name}:{title}"
+    return f"{mod}:{name}"
+
 
 def _material_for_embedding(func, docstring: str, signature: str, queries: list[str] | None) -> str:
     parts = [func.__name__, docstring, signature]
