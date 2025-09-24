@@ -707,7 +707,7 @@ class MemAgent:
                 "required": req
             }
         }
-        logger.debug(f"[Formatted tool {name}] {json.dumps(formatted_tool, indent=2)}")
+        print(f"[Formatted tool {name}] {json.dumps(formatted_tool, indent=2)}")
         if "_id" in tool_meta:
             formatted_tool["_id"] = str(tool_meta["_id"])
         return formatted_tool
