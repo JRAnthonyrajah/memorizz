@@ -85,81 +85,81 @@ class Toolbox:
         # In-memory storage of functions
         self._tools: Dict[str, Callable] = {}
 
+
     def register_tool(self, func: Optional[Callable] = None, augment: bool = False) -> Union[str, Callable]:
         """
         Register a function as a tool in the toolbox.
-        
-        Parameters:
-        -----------
-        func : Callable, optional
-            The function to register as a tool. If None, returns a decorator.
-        augment : bool, optional
-            Whether to augment the tool docstring and generate synthetic queries
-            using the configured LLM provider.
-        Returns:
-        --------
-        Union[str, Callable]
-            If func is provided, returns the tool ID. Otherwise returns a decorator.
         """
         def decorator(f: Callable) -> str:
+            t0 = time.perf_counter()
             docstring = f.__doc__ or ""
             signature = str(inspect.signature(f))
             tool_key = _tool_key(f)
-            # NEW: derive canonical parameters from the adapter-attached schema
-
-
+            log.debug("[toolbox] registering tool: key=%s func=%s augment=%s", tool_key, getattr(f, "__name__", f), augment)
 
             # --- canonical parameters extraction/flattening ---
             def _canonical_param_list_from_fn(f: Callable) -> List[Dict[str, Any]]:
-                """
-                Read the JSON Schema attached by the MCP adapter and flatten it into
-                a stable parameter list that preserves canonical property keys.
-                """
                 schema = getattr(f, "_openai_parameters", None)
                 if not isinstance(schema, dict) or schema.get("type") != "object":
+                    log.debug("[toolbox] no _openai_parameters found for %s", tool_key)
                     return []
                 props = schema.get("properties", {}) or {}
                 required = set(schema.get("required", []) or [])
                 out: List[Dict[str, Any]] = []
-                for name, spec in props.items():  # ← property key verbatim (no aliasing)
+                for name, spec in props.items():
                     out.append({
                         "name": name,
                         "description": spec.get("description", ""),
                         "type": spec.get("type", "string"),
                         "required": name in required,
                     })
+                log.debug("[toolbox] extracted %d canonical params for %s", len(out), tool_key)
                 return out
 
             param_list = _canonical_param_list_from_fn(f)
-            
-            
+            if param_list:
+                log.trace if hasattr(log, "trace") else log.debug  # no-op if no TRACE level
+                log.debug("[toolbox] params(%s)=%s", tool_key, param_list)
+
+            # ---- material + metadata (augmentation optional) ----
             if augment:
-                # Use the configured LLM provider for augmentation
+                log.debug("[toolbox] augmenting docstring for %s", tool_key)
                 augmented_docstring = self._augment_docstring(docstring)
                 queries = self._generate_queries(augmented_docstring)
                 material = _material_for_embedding(f, augmented_docstring, signature, queries)
                 tool_data = self._get_tool_metadata(f)
+                log.debug("[toolbox] augmentation produced %d queries for %s", len(queries or []), tool_key)
             else:
-                material = _material_for_embedding(f, docstring, signature, None)
                 queries = None
+                material = _material_for_embedding(f, docstring, signature, None)
                 tool_data = self._get_tool_metadata(f)
-                
+
+            # ---- hash / existing lookup ----
             h = _content_hash(material, EMBED_MODEL_ID)
             existing = self.memory_provider.retrieve_by_name(tool_key, memory_store_type=MemoryType.TOOLBOX)
+            if existing:
+                log.debug("[toolbox] existing record found for %s (_id=%s)", tool_key, existing.get("_id"))
+            else:
+                log.debug("[toolbox] no existing record for %s; creating new", tool_key)
 
-            
-
+            # ---- unchanged fast-path ----
             if existing and existing.get("content_hash") == h and existing.get("embedding_model_id") == EMBED_MODEL_ID:
-                # No change → do not recompute or insert
                 tool_id = str(existing["_id"])
-                self._tools[tool_id] = f
+                self._tools[tool_id] = f  # rebind callable in this process
+                dt = (time.perf_counter() - t0) * 1000
+                log.info("[toolbox] ✓ reused tool (no re-embed): %s (_id=%s) in %.1f ms", tool_key, tool_id, dt)
+                log.debug("[toolbox] totals: in_memory=%d stored≈%s",
+                        len(self._tools), getattr(self, "memory_provider", None) and "?" )
                 return tool_id
 
-            # Changed or new → (re)embed & upsert
+            # ---- changed/new → embed & upsert ----
+            e0 = time.perf_counter()
             embedding = get_embedding(material)
+            e_dt = (time.perf_counter() - e0) * 1000
+            emb_dim = len(embedding) if hasattr(embedding, "__len__") else "?"
+            log.info("[toolbox] embedding computed for %s: dim=%s in %.1f ms", tool_key, emb_dim, e_dt)
 
             tool_record = {
-                # Keep existing _id if present to avoid churn
                 "_id": existing["_id"] if existing and "_id" in existing else ObjectId(),
                 "name": tool_key,
                 "embedding": embedding,
@@ -167,22 +167,38 @@ class Toolbox:
                 "content_hash": h,
                 "updated_at": time.time(),
                 **tool_data.model_dump(),
+                # optional diagnostics (won't affect search if your schema ignores them):
+                "diagnostics": {
+                    "signature": signature,
+                    "param_list": param_list,
+                    "augment": bool(augment),
+                    "queries_count": len(queries or []),
+                },
             }
             if queries is not None:
                 tool_record["queries"] = queries
 
-            # Upsert by name (tool_key)
             if existing:
                 self.memory_provider.update_by_id(tool_record["_id"], tool_record, memory_store_type=MemoryType.TOOLBOX)
                 tool_id = str(tool_record["_id"])
+                log.info("[toolbox] ↑ updated tool: %s (_id=%s)", tool_key, tool_id)
             else:
                 self.memory_provider.store(tool_record, memory_store_type=MemoryType.TOOLBOX)
                 tool_id = str(tool_record["_id"])
+                log.info("[toolbox] + inserted tool: %s (_id=%s)", tool_key, tool_id)
 
             self._tools[tool_id] = f
+            dt = (time.perf_counter() - t0) * 1000
+            try:
+                stored_count = len(self.list_tools())
+            except Exception:
+                stored_count = "?"
+            log.debug("[toolbox] totals after register: in_memory=%d stored=%s (%.1f ms)", len(self._tools), stored_count, dt)
             return tool_id
 
         return decorator if func is None else decorator(func)
+
+
 
     def replace_function_by_id(self, tool_id: str, func: Callable) -> bool:
             """Replace the callable function for a tool by its ID."""
