@@ -674,7 +674,7 @@ class MemAgent:
                 param_type = p.get("type", "string").lower().strip()
                 if "(" in param_type:
                     param_type = param_type.split("(")[0].strip()
-                if param_type in ["float", "decimal", "double", "numeric", "number"]:
+                if param_type in ["float", "decimal", "double", "numeric"]:
                     param_type = "number"
                 elif param_type in ["int", "integer"]:
                     param_type = "integer"
@@ -685,35 +685,37 @@ class MemAgent:
                 elif param_type not in ["string", "number", "integer", "boolean", "array", "object"]:
                     param_type = "string"
 
-                # Preserve all fields in the parameter schema
                 param_schema = {
                     "type": param_type,
                     "description": p.get("description", "")
                 }
-                # Copy additional fields like 'items', 'enum', 'default'
-                for key in ["items", "enum", "default"]:
+                # Preserve or add items for array parameters
+                if param_type == "array":
+                    param_schema["items"] = p.get("items", {"type": "string"})  # Add default items if missing
+                # Preserve other fields (enum, default)
+                for key in ["enum", "default"]:
                     if key in p:
                         param_schema[key] = p.get(key)
-
                 props[param_name] = param_schema
                 if p.get("required", False):
                     req.append(param_name)
 
         formatted_tool = {
             "type": "function",
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": props,
-                "required": req
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": props,
+                    "required": req
+                }
             }
         }
-        print(f"[Formatted tool {name}] {json.dumps(formatted_tool, indent=2)}")
+        logger.debug(f"[Formatted tool {name}] {json.dumps(formatted_tool, indent=2)}")
         if "_id" in tool_meta:
             formatted_tool["_id"] = str(tool_meta["_id"])
         return formatted_tool
-
 
     def _load_tools_from_toolbox(self, query: str):
         """
