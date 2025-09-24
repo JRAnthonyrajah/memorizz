@@ -675,19 +675,37 @@ class MemAgent:
                 param_name = p.get("name")
                 if not param_name:
                     continue
-                # Copy the entire parameter schema, preserving fields like 'items'
+                # Normalize the parameter type
+                param_type = p.get("type", "string")
+                if isinstance(param_type, str):
+                    param_type = param_type.lower().strip()
+                    if "(" in param_type:
+                        param_type = param_type.split("(")[0].strip()
+                    if param_type in ["float", "decimal", "double", "numeric", "number"]:
+                        param_type = "number"
+                    elif param_type in ["int", "integer"]:
+                        param_type = "integer"
+                    elif param_type in ["bool", "boolean"]:
+                        param_type = "boolean"
+                    elif param_type in ["str", "text"]:
+                        param_type = "string"
+                    elif param_type not in ["string", "number", "integer", "boolean", "array", "object"]:
+                        param_type = "string"
+                
+                # Create parameter schema, preserving all fields
                 param_schema = {
-                    "type": p.get("type", "string"),
+                    "type": param_type,
                     "description": p.get("description", "")
                 }
-                # Include additional fields like 'items' for arrays
-                if p.get("type") == "array" and "items" in p:
+                # Preserve additional fields like 'items' for arrays
+                if param_type == "array" and "items" in p:
                     param_schema["items"] = p.get("items")
+                
                 props[param_name] = param_schema
                 if p.get("required", False):
                     req.append(param_name)
 
-        return {
+        formatted_tool = {
             "type": "function",
             "name": name,
             "description": description,
@@ -697,6 +715,9 @@ class MemAgent:
                 "required": req
             }
         }
+        logger.debug(f"[Formatted tool {name}] {json.dumps(formatted_tool, indent=2)}")
+        return formatted_tool
+
 
     def _load_tools_from_toolbox(self, query: str):
         """
