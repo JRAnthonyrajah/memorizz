@@ -682,6 +682,8 @@ class MemAgent:
                     param_type = "boolean"
                 elif param_type in ["str", "text"]:
                     param_type = "string"
+                elif param_type in ["list", "array"]:
+                    param_type = "array"
                 elif param_type not in ["string", "number", "integer", "boolean", "array", "object"]:
                     param_type = "string"
 
@@ -712,7 +714,7 @@ class MemAgent:
                 }
             }
         }
-        logger.debug(f"[Formatted tool {name}] {json.dumps(formatted_tool, indent=2)}")
+        print(f"[Formatted tool {name}] {json.dumps(formatted_tool, indent=2)}")
         if "_id" in tool_meta:
             formatted_tool["_id"] = str(tool_meta["_id"])
         return formatted_tool
