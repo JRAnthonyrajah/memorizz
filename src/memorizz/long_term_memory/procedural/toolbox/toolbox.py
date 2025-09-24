@@ -89,7 +89,9 @@ class Toolbox:
         
         # In-memory storage of functions
         self._tools: Dict[str, Callable] = {}
-
+        self._by_name: dict[str, list[str]] = {}
+        self._by_fqn: dict[str, str] = {}
+        
 
     def register_tool(self, func: Optional[Callable] = None, augment: bool = False) -> Union[str, Callable]:
         def decorator(f: Callable) -> str:
@@ -105,10 +107,12 @@ class Toolbox:
             docstring = f.__doc__ or ""
             signature = str(inspect.signature(f))
 
-            tool_key   = _tool_key(f)           # normalized, canonical plain name (e.g., "read_file")
-            legacy_key = _legacy_tool_key(f)    # legacy identifier (e.g., "pkg.module:Class.method")
+            tool_key   = _tool_key(f)        # canonical normalized key (e.g., "read_file")
+            legacy_key = _legacy_tool_key(f) # legacy identifier
 
-
+            # NEW: pull metadata exported by your MCP adapter
+            openai_name = getattr(f, "_openai_name", None)  # e.g., "obsidian_list_notes"
+            fqn         = getattr(f, "_fqn", None)          # e.g., "fs:obsidian_list_notes"
 
             # -------- embedding material / metadata ----------
             if augment:
@@ -137,36 +141,42 @@ class Toolbox:
                 )
             )
 
-            # Choose the record to treat as "the existing one" (prefer hash match)
             existing = existing_by_hash or existing_by_name
 
-            # -------- embedding decision: REUSE when hashes match ----------
+            # -------- embedding decision ----------
             if existing and existing.get("content_hash") == h and \
             existing.get("embedding_model_id") == EMBED_MODEL_ID and \
             isinstance(existing.get("embedding"), (list, tuple)) and existing.get("embedding"):
-                embedding = existing["embedding"]           # ← reuse, do NOT recompute
+                embedding = existing["embedding"]
             else:
-                embedding = None  # compute lazily, only if we insert
+                embedding = None
 
             # -------- consolidate aliases / id ----------
             record_id = existing.get("_id") if existing else ObjectId()
             aliases = set((existing.get("aliases") or []) if existing else [])
-            # keep any prior name under aliases when renaming to normalized key
+
             old_name = (existing.get("name") if existing else None)
             if old_name and old_name != tool_key:
                 aliases.add(old_name)
             if legacy_key and legacy_key != tool_key:
                 aliases.add(legacy_key)
+            # NEW: include runtime-exported names
+            if openai_name and openai_name != tool_key:
+                aliases.add(openai_name)
+            if fqn:
+                aliases.add(fqn)
 
-            # -------- build record shell (without recomputation) ----------
-            # Note: only include embedding if we have it; otherwise we’ll compute before insert
+            # -------- build record shell ----------
             tool_record = {
                 "_id": record_id,
-                "name": tool_key,
+                "name": tool_key,                 # keep canonical stable key
                 "aliases": sorted(a for a in aliases if a),
                 "embedding_model_id": EMBED_MODEL_ID,
                 "content_hash": h,
                 "updated_at": time.time(),
+                # NEW: persist these for debugging / resolution
+                "fqn": fqn,
+                "display_name": openai_name or tool_key,
                 **tool_meta.model_dump(),
             }
             if queries is not None:
@@ -176,70 +186,74 @@ class Toolbox:
 
             coll = self.memory_provider.collection(memory_store_type=MemoryType.TOOLBOX)
 
-            # -------- upsert strategy (concurrency safe) ----------
-            # Case A: we already have a matching doc (by hash or name)
+            # -------- upsert strategy ----------
             if existing:
-                # If we didn’t have embedding populated (rare), compute once
                 if "embedding" not in tool_record:
                     tool_record["embedding"] = get_embedding(material)
-                self.memory_provider.update_by_id(record_id, tool_record, memory_store_type=MemoryType.TOOLBOX)
-
+                # FIX: pass string id
+                self.memory_provider.update_by_id(str(record_id), tool_record, memory_store_type=MemoryType.TOOLBOX)
             else:
-                # Case B: new record. We want to avoid computing an embedding if someone else is
-                # inserting the same hash concurrently. Two-phase:
-                # 1) Try a **cheap** read by hash again (tiny window close), then compute only if absent.
                 again = self.memory_provider.retrieve_by_hash(h, EMBED_MODEL_ID, memory_store_type=MemoryType.TOOLBOX)
                 if again:
-                    # someone else won the race — reuse their embedding and _id
                     record_id = again["_id"]
                     tool_record["_id"] = record_id
                     tool_record["embedding"] = again.get("embedding")
                     tool_record["aliases"] = sorted(set(tool_record["aliases"]) | set(again.get("aliases", [])))
-                    tool_record["name"] = tool_key  # may update name; keep their _id
-                    self.memory_provider.update_by_id(record_id, tool_record, memory_store_type=MemoryType.TOOLBOX)
+                    tool_record["name"] = tool_key
+                    # FIX: pass string id
+                    self.memory_provider.update_by_id(str(record_id), tool_record, memory_store_type=MemoryType.TOOLBOX)
                 else:
-                    # 2) Compute once and attempt insert; if duplicate, re-read and reuse
                     if "embedding" not in tool_record:
                         tool_record["embedding"] = get_embedding(material)
                     try:
                         self.memory_provider.store(tool_record, memory_store_type=MemoryType.TOOLBOX)
                     except DuplicateKeyError:
-                        # Another writer inserted the same (model_id, hash) between compute and insert
-                        winner = self.memory_provider.retrieve_by_hash(h, EMBED_MODEL_ID, memory_store_type=MemoryType.TOOLBOX)
-                        if not winner:
-                            # Extremely rare; fall back to name
-                            winner = self.memory_provider.retrieve_by_name(tool_key, memory_store_type=MemoryType.TOOLBOX)
+                        winner = self.memory_provider.retrieve_by_hash(h, EMBED_MODEL_ID, memory_store_type=MemoryType.TOOLBOX) \
+                            or self.memory_provider.retrieve_by_name(tool_key, memory_store_type=MemoryType.TOOLBOX)
                         if winner:
                             record_id = winner["_id"]
-                            # Optionally merge aliases and normalized name
                             merged_aliases = sorted(set((winner.get("aliases") or [])) | set(tool_record["aliases"]))
                             patch = {
                                 "name": tool_key,
                                 "aliases": merged_aliases,
                                 "updated_at": time.time(),
+                                "fqn": fqn,
+                                "display_name": openai_name or tool_key,
                             }
-                            self.memory_provider.update_by_id(record_id, patch, memory_store_type=MemoryType.TOOLBOX)
+                            # FIX: pass string id
+                            self.memory_provider.update_by_id(str(record_id), patch, memory_store_type=MemoryType.TOOLBOX)
                         else:
-                            # last resort – rethrow so you see it in logs
                             raise
 
-            # keep callable in this process for runtime dispatch
+            # -------- runtime registry (for actual execution) ----------
             tool_id = str(record_id)
+            if not callable(f):
+                raise TypeError(f"register_tool expected callable, got {type(f).__name__}")
+
+            # Ensure maps exist
+            self._tools   = getattr(self, "_tools", {})
+            self._by_name = getattr(self, "_by_name", {})
+            self._by_fqn  = getattr(self, "_by_fqn", {})
+
             self._tools[tool_id] = f
 
-            # optional logging
+            # index by both the canonical key and the OpenAI-exported name
+            for nm in {tool_key, openai_name} - {None}:
+                self._by_name.setdefault(nm, []).append(tool_id)
+            if fqn:
+                self._by_fqn[fqn] = tool_id
+
+            # logging (avoid reserved 'name' in logging extra)
             logger = getattr(self, "logger", None)
             if logger:
                 logger.debug(
-                    "[toolbox] upserted tool name=%s id=%s (aliases=%s)",
-                    tool_key, tool_id, ",".join(tool_record.get("aliases", []))
+                    "[toolbox] upserted tool key=%s id=%s fqn=%s aliases=%s",
+                    tool_key, tool_id, fqn, ",".join(tool_record.get("aliases", []))
                 )
 
             return tool_id
 
         return decorator if func is None else decorator(func)
-
-
 
 
 
