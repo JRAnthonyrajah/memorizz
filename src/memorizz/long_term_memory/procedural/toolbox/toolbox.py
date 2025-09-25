@@ -93,169 +93,60 @@ class Toolbox:
         self._by_fqn: dict[str, str] = {}
         
 
+
+
     def register_tool(self, func: Optional[Callable] = None, augment: bool = False) -> Union[str, Callable]:
+        """
+        Register a function as a tool in the toolbox.
+        
+        Parameters:
+        -----------
+        func : Callable, optional
+            The function to register as a tool. If None, returns a decorator.
+        augment : bool, optional
+            Whether to augment the tool docstring and generate synthetic queries
+            using the configured LLM provider.
+        Returns:
+        --------
+        Union[str, Callable]
+            If func is provided, returns the tool ID. Otherwise returns a decorator.
+        """
         def decorator(f: Callable) -> str:
-            import time
-            import inspect
-            from bson import ObjectId
-            from pymongo.errors import DuplicateKeyError
-
-            from ....embeddings import get_embedding
-            from ....enums.memory_type import MemoryType
-
-            # -------- names / signatures / params ----------
             docstring = f.__doc__ or ""
             signature = str(inspect.signature(f))
+            object_id = ObjectId()
+            object_id_str = str(object_id)
 
-            tool_key   = _tool_key(f)        # canonical normalized key (e.g., "read_file")
-            legacy_key = _legacy_tool_key(f) # legacy identifier
-
-            # NEW: pull metadata exported by your MCP adapter
-            openai_name = getattr(f, "_openai_name", None)  # e.g., "obsidian_list_notes"
-            fqn         = getattr(f, "_fqn", None)          # e.g., "fs:obsidian_list_notes"
-
-            # -------- embedding material / metadata ----------
             if augment:
+                # Use the configured LLM provider for augmentation
                 augmented_docstring = self._augment_docstring(docstring)
-                queries  = self._generate_queries(augmented_docstring)
-                material = _material_for_embedding(f, augmented_docstring, signature, queries)
-                tool_meta = self._get_tool_metadata(f)
+                queries = self._generate_queries(augmented_docstring)
+                embedding = get_embedding(f"{f.__name__} {augmented_docstring} {signature} {queries}")
+                tool_data = self._get_tool_metadata(f)
+                
+                tool_dict = {
+                    "_id": object_id,
+                    "embedding": embedding,
+                    "queries": queries,
+                    **tool_data.model_dump()
+                }
             else:
-                queries  = None
-                material = _material_for_embedding(f, docstring, signature, None)
-                tool_meta = self._get_tool_metadata(f)
+                embedding = get_embedding(f"{f.__name__} {docstring} {signature}")
+                tool_data = self._get_tool_metadata(f)
+                
+                tool_dict = {
+                    "_id": object_id,
+                    "embedding": embedding,
+                    **tool_data.model_dump()
+                }
+            
+            self.memory_provider.store(tool_dict, memory_store_type=MemoryType.TOOLBOX)
+            self._tools[object_id_str] = f
+            return object_id_str
 
-            h = _content_hash(material, EMBED_MODEL_ID)
-
-            # -------- primary lookup path: by hash + model (dedup) ----------
-            existing_by_hash = self.memory_provider.retrieve_by_hash(
-                h, EMBED_MODEL_ID, memory_store_type=MemoryType.TOOLBOX
-            )
-
-            # Secondary (migration support): by normalized name or legacy name
-            existing_by_name = self.memory_provider.retrieve_by_name(
-                tool_key, memory_store_type=MemoryType.TOOLBOX
-            ) or (
-                legacy_key and self.memory_provider.retrieve_by_name(
-                    legacy_key, memory_store_type=MemoryType.TOOLBOX
-                )
-            )
-
-            existing = existing_by_hash or existing_by_name
-
-            # -------- embedding decision ----------
-            if existing and existing.get("content_hash") == h and \
-            existing.get("embedding_model_id") == EMBED_MODEL_ID and \
-            isinstance(existing.get("embedding"), (list, tuple)) and existing.get("embedding"):
-                embedding = existing["embedding"]
-            else:
-                embedding = None
-
-            # -------- consolidate aliases / id ----------
-            record_id = existing.get("_id") if existing else ObjectId()
-            aliases = set((existing.get("aliases") or []) if existing else [])
-
-            old_name = (existing.get("name") if existing else None)
-            if old_name and old_name != tool_key:
-                aliases.add(old_name)
-            if legacy_key and legacy_key != tool_key:
-                aliases.add(legacy_key)
-            # NEW: include runtime-exported names
-            if openai_name and openai_name != tool_key:
-                aliases.add(openai_name)
-            if fqn:
-                aliases.add(fqn)
-
-            # -------- build record shell ----------
-            tool_record = {
-                "_id": record_id,
-                "name": tool_key,                 # keep canonical stable key
-                "aliases": sorted(a for a in aliases if a),
-                "embedding_model_id": EMBED_MODEL_ID,
-                "content_hash": h,
-                "updated_at": time.time(),
-                # NEW: persist these for debugging / resolution
-                "fqn": fqn,
-                "display_name": openai_name or tool_key,
-                **tool_meta.model_dump(),
-            }
-            if queries is not None:
-                tool_record["queries"] = queries
-            if embedding is not None:
-                tool_record["embedding"] = embedding
-
-            coll = self.memory_provider.collection(memory_store_type=MemoryType.TOOLBOX)
-
-            # -------- upsert strategy ----------
-            if existing:
-                if "embedding" not in tool_record:
-                    tool_record["embedding"] = get_embedding(material)
-                # FIX: pass string id
-                self.memory_provider.update_by_id(str(record_id), tool_record, memory_store_type=MemoryType.TOOLBOX)
-            else:
-                again = self.memory_provider.retrieve_by_hash(h, EMBED_MODEL_ID, memory_store_type=MemoryType.TOOLBOX)
-                if again:
-                    record_id = again["_id"]
-                    tool_record["_id"] = record_id
-                    tool_record["embedding"] = again.get("embedding")
-                    tool_record["aliases"] = sorted(set(tool_record["aliases"]) | set(again.get("aliases", [])))
-                    tool_record["name"] = tool_key
-                    # FIX: pass string id
-                    self.memory_provider.update_by_id(str(record_id), tool_record, memory_store_type=MemoryType.TOOLBOX)
-                else:
-                    if "embedding" not in tool_record:
-                        tool_record["embedding"] = get_embedding(material)
-                    try:
-                        self.memory_provider.store(tool_record, memory_store_type=MemoryType.TOOLBOX)
-                    except DuplicateKeyError:
-                        winner = self.memory_provider.retrieve_by_hash(h, EMBED_MODEL_ID, memory_store_type=MemoryType.TOOLBOX) \
-                            or self.memory_provider.retrieve_by_name(tool_key, memory_store_type=MemoryType.TOOLBOX)
-                        if winner:
-                            record_id = winner["_id"]
-                            merged_aliases = sorted(set((winner.get("aliases") or [])) | set(tool_record["aliases"]))
-                            patch = {
-                                "name": tool_key,
-                                "aliases": merged_aliases,
-                                "updated_at": time.time(),
-                                "fqn": fqn,
-                                "display_name": openai_name or tool_key,
-                            }
-                            # FIX: pass string id
-                            self.memory_provider.update_by_id(str(record_id), patch, memory_store_type=MemoryType.TOOLBOX)
-                        else:
-                            raise
-
-            # -------- runtime registry (for actual execution) ----------
-            tool_id = str(record_id)
-            if not callable(f):
-                raise TypeError(f"register_tool expected callable, got {type(f).__name__}")
-
-            # Ensure maps exist
-            self._tools   = getattr(self, "_tools", {})
-            self._by_name = getattr(self, "_by_name", {})
-            self._by_fqn  = getattr(self, "_by_fqn", {})
-
-            self._tools[tool_id] = f
-
-            # index by both the canonical key and the OpenAI-exported name
-            for nm in {tool_key, openai_name} - {None}:
-                self._by_name.setdefault(nm, []).append(tool_id)
-            if fqn:
-                self._by_fqn[fqn] = tool_id
-
-            # logging (avoid reserved 'name' in logging extra)
-            logger = getattr(self, "logger", None)
-            if logger:
-                logger.debug(
-                    "[toolbox] upserted tool key=%s id=%s fqn=%s aliases=%s",
-                    tool_key, tool_id, fqn, ",".join(tool_record.get("aliases", []))
-                )
-
-            return tool_id
-
-        return decorator if func is None else decorator(func)
-
-
+        if func is None:
+            return decorator
+        return decorator(func)
 
     def replace_function_by_id(self, tool_id: str, func: Callable) -> bool:
             """Replace the callable function for a tool by its ID."""
