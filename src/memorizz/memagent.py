@@ -714,7 +714,7 @@ class MemAgent:
                 }
             }
         }
-        print(f"[Formatted tool {name}] {json.dumps(formatted_tool, indent=2)}")
+        logger.info(f"[Formatted tool {name}] {json.dumps(formatted_tool, indent=2)}")
         if "_id" in tool_meta:
             formatted_tool["_id"] = str(tool_meta["_id"])
         return formatted_tool
@@ -1251,7 +1251,7 @@ class MemAgent:
         for step in range(self.max_steps):
             # a) Build function schema list
             tool_metas, tool_choice = self._prepare_tools(query, tool_choice)
-            print(f"[API payload tools] {json.dumps(tool_metas, indent=2, default=str)}")
+            logger.debug(f"[API payload tools] {json.dumps(tool_metas, indent=2, default=str)}")
 
             # b) Call the LLM API using the configured model
             response = self.model.client.responses.create(
