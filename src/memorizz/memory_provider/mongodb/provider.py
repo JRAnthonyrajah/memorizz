@@ -1730,10 +1730,12 @@ class MongoDBProvider(MemoryProvider):
         # useful to narrow the scope of your semantic search and ensure that not all vectors are considered for comparison. 
         # It reduces the number of documents against which to run similarity comparisons, which can decrease query latency and increase the accuracy of search results.
         if memory_store:
-            vector_index_definition["fields"].append({
-                "type": "filter",
-                "path": "memory_id",
-            })
+            vector_index_definition["fields"].extend([
+                {"type": "filter", "path": "agent_id"},
+                {"type": "filter", "path": "memory_id"},
+                {"type": "filter", "path": "session_id"},
+            ])
+
 
         new_vector_search_index_model = SearchIndexModel(
             definition=vector_index_definition, name=index_name, type="vectorSearch"
