@@ -92,10 +92,28 @@ class OpenAI(LLMProvider):
                 if isinstance(spec, dict):
                     t = spec.get("type") or "string"
                     d = spec.get("description") or ""
+                    enum = spec.get("enum")
+                    const = spec.get("const")
+                    fmt = spec.get("format")
+                    default = spec.get("default")
+                    extra = []
+                    if enum:
+                        # show canonical literals exactly as the tool expects
+                        extra.append("enum={" + ", ".join([repr(x) for x in enum]) + "}")
+                    if const is not None:
+                        extra.append(f"const={repr(const)}")
+                    if fmt:
+                        extra.append(f"format={fmt}")
+                    if default is not None:
+                        extra.append(f"default={repr(default)}")
+                    extrastr = (" [" + "; ".join(extra) + "]") if extra else ""
+                    req = " [required]" if n in schema_req else ""
+                    desc = (": " + d) if d else ""
+                    rows.append(f"- {n} ({t}){req}{extrastr}{desc}")
                 else:
-                    t, d = "string", ""
-                rows.append(f"- {n} ({t}) {('[required]' if n in schema_req else '')}{(': ' + d) if d else ''}")
+                    rows.append(f"- {n} (string){' [required]' if n in schema_req else ''}")
             return "\n".join(rows) or "(none)"
+
 
         disallowed_example = []
         if "path" in schema_props:
@@ -120,6 +138,8 @@ class OpenAI(LLMProvider):
             "2) Include all and only these parameters in the 'parameters' array.\n"
             "3) The 'required' list must match the canonical 'required'.\n"
             "4) If you were going to use any aliases, replace them with the canonical names.\n"
+            "5) For any parameter with enum/const, you MUST use exactly one of the listed literals (case-sensitive).\n"
+            "6) Do not invent defaults or additional properties.\n"
         )
         if disallowed_example:
             constraint_block += (
@@ -127,6 +147,16 @@ class OpenAI(LLMProvider):
                 "\n".join([f"- {ex['wrong']} → {ex['right']}" for ex in disallowed_example]) +
                 "\n"
             )
+        if "sitemap" in schema_props and isinstance(schema_props["sitemap"], dict) and schema_props["sitemap"].get("enum"):
+            constraint_block += (
+                "EXAMPLES (wrong → right):\n"
+                "- true → \"include\"\n"
+                "- false → \"skip\"\n"
+                "- all → \"include\"\n"
+                "- Include → \"include\"\n"
+                "- ONLY → \"only\"\n"
+            )
+
 
         user_msg = {
             "role": "user",
