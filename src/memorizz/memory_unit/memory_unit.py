@@ -1,9 +1,16 @@
+# memory_unit.py
+from __future__ import annotations
+import asyncio, math, re
+import concurrent.futures
+
+from memorizz.src.memorizz import memory_unit
+
 from .conversational_memory_unit import ConversationMemoryUnit
 from ..memory_provider import MemoryProvider
 from ..enums.memory_type import MemoryType
 from ..enums.application_mode import ApplicationMode, ApplicationModeConfig
 from ..embeddings import get_embedding
-from typing import TYPE_CHECKING, Dict, Any, List, Optional
+from typing import TYPE_CHECKING, Dict, Any, List, Optional, Iterable, Tuple,
 import time
 import numpy as np
 import pprint
@@ -14,6 +21,58 @@ from ..llms.llm_provider import LLMProvider
 def get_openai_llm():
     from ..llms.openai import OpenAI
     return OpenAI()
+
+
+
+_FLOAT_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+
+
+def _parse_float(s: str, default: float = 0.5) -> float:
+    m = _FLOAT_RE.search(str(s))
+    if not m:
+        return default
+    try:
+        x = float(m.group(0))
+        return 0.0 if x < 0 else 1.0 if x > 1 else x
+    except Exception:
+        return default
+
+# simple in-proc cache for importance: {(mu_id, model, schema_ver): (score, ts)}
+_IMPORTANCE_CACHE: Dict[Tuple[str, str, int], Tuple[float, float]] = {}
+_IMPORTANCE_CACHE_TTL = 24 * 3600
+_IMPORTANCE_SCHEMA_VERSION = 1
+
+def _cache_key(mu_id: str, model: str) -> Tuple[str, str, int]:
+    return (mu_id, model, _IMPORTANCE_SCHEMA_VERSION)
+
+def _importance_prompt(mu_text: str, query: str) -> str:
+    return (
+        "You are scoring the *importance* of a memory item for future recall.\n"
+        "Return only a float in [0,1]. No words.\n\n"
+        f"MEMORY:\n{(mu_text or '').strip()[:1200]}\n\nQUERY:\n{(query or '').strip()[:400]}"
+    )
+
+def _now() -> float:
+    return time.time()
+
+def _cache_get(mu_id: str, model: str) -> Optional[float]:
+    k = _cache_key(mu_id, model)
+    v = _IMPORTANCE_CACHE.get(k)
+    if not v:
+        return None
+    score, ts = v
+    if (_now() - ts) > _IMPORTANCE_CACHE_TTL:
+        _IMPORTANCE_CACHE.pop(k, None)
+        return None
+    return score
+
+def _cache_put(mu_id: str, model: str, score: float) -> None:
+    _IMPORTANCE_CACHE[_cache_key(mu_id, model)] = (float(score), _now())
+
+def _get_mu_id(mu: Any, fallback: str) -> str:
+    # try common id fields; adjust if your provider uses a different key
+    return str(mu.get("_id") or mu.get("id") or fallback)
+
 
 class MemoryUnit:
     def __init__(self, application_mode: str, memory_provider: MemoryProvider = None, llm_provider: Optional[LLMProvider] = None):
@@ -221,12 +280,21 @@ class MemoryUnit:
             surrounding_conversation_ids.append(memory_unit["_id"])
 
         # Before returning the memory units, we need to update the memory signals within the memory units
-        for memory_unit in memory_units:
-            self.update_memory_signals_within_memory_unit(memory_unit, memory_type, surrounding_conversation_ids)
+        # 1) Update fields that do not require I/O or LLMs
+        for mu in memory_units:
+            self.update_memory_signals_within_memory_unit(mu, memory_type, surrounding_conversation_ids)
 
-        # Calculate the memory signal for each of the memory units
-        for memory_unit in memory_units:
-            memory_unit["memory_signal"] = self.calculate_memory_signal(memory_unit, query)
+        # 2) Batch-compute LLM importance once for all units (bounded concurrency; cached)
+        importance_scores = self._run_coro_in_loop(
+            self._async_importance_batch(memory_units, query, max_concurrency=5)
+        )
+        for mu, s in zip(memory_units, importance_scores):
+            mu["importance"] = float(s)
+
+        # 3) Now compute the final memory_signal using the pre-filled 'importance'
+        for mu in memory_units:
+            mu["memory_signal"] = self.calculate_memory_signal(mu, query)
+
 
         # Sort the memory units by the memory signal
         memory_units.sort(key=lambda x: x["memory_signal"], reverse=True)
@@ -280,7 +348,9 @@ class MemoryUnit:
             relevance = self.calculate_relevance(query, memory_unit)
 
         # Calulate importance of the memory unit
-        importance = self.calculate_importance(memory_unit["content"], query)
+        importance = memory_unit.get("importance")
+        if importance is None:
+            importance = self.calculate_importance(memory_unit["content"], query)
 
         # Calculate the normalized memory signal
         memory_signal = recency * number_of_associated_conversation_ids * relevance * importance
@@ -373,3 +443,97 @@ class MemoryUnit:
         # Return the importance
         return float(importance)
 
+    # --- Add inside class MemoryUnit (method definitions) ---
+
+    async def _async_importance_batch(
+        self,
+        memory_units: List[dict],
+        query: str,
+        *,
+        max_concurrency: int = 5,
+        instructions: str = "Return only a number in [0,1]."
+        ) -> List[float]:
+        """
+        Compute LLM-based importance for many memory units in parallel with bounded concurrency.
+        Uses provider async methods if available; else threadpooled sync fallback.
+        Applies a simple in-proc cache keyed by (mu_id, model, schema_version).
+        """
+        model = getattr(self.llm_provider, "model", "unknown")
+
+        # Build todo list and prefill cached results
+        scores: Dict[int, float] = {}
+        todo: List[Tuple[int, dict, str, str]] = []  # (idx, mu, mu_id, prompt)
+
+        for idx, mu in enumerate(memory_units):
+            mu_id = _get_mu_id(mu, f"idx:{idx}")
+            cached = _cache_get(mu_id, model)
+            if cached is not None:
+                scores[idx] = cached
+                continue
+            prompt = _importance_prompt(mu.get("content", ""), query)
+            todo.append((idx, mu, mu_id, prompt))
+
+        # Nothing to do?
+        if not todo:
+            return [scores[i] if i in scores else 0.5 for i in range(len(memory_units))]
+
+        # Choose the best available path
+        has_async_batch = hasattr(self.llm_provider, "async_generate_batch")
+        has_async_single = hasattr(self.llm_provider, "async_generate_text")
+
+        async def _run_async_batch() -> None:
+            # Provider-level batch if implemented
+            outs = await self.llm_provider.async_generate_batch(  # type: ignore[attr-defined]
+                (p for (_, _, _, p) in todo),
+                instructions=instructions,
+            )
+            for (idx, _, mu_id, _), out in zip(todo, outs):
+                score = _parse_float(out)
+                scores[idx] = score
+                _cache_put(mu_id, model, score)
+
+        async def _run_async_fanout() -> None:
+            sem = asyncio.Semaphore(max_concurrency)
+            async def one(idx: int, mu_id: str, prompt: str):
+                async with sem:
+                    out = await self.llm_provider.async_generate_text(  # type: ignore[attr-defined]
+                        prompt, instructions=instructions
+                    )
+                    score = _parse_float(out)
+                    scores[idx] = score
+                    _cache_put(mu_id, model, score)
+            await asyncio.gather(*(one(idx, mu_id, prompt) for (idx, _, mu_id, prompt) in todo))
+
+        def _run_sync_threadpool() -> None:
+            def one(args):
+                idx, _, mu_id, prompt = args
+                out = self.llm_provider.generate_text(prompt, instructions=instructions)
+                score = _parse_float(out)
+                scores[idx] = score
+                _cache_put(mu_id, model, score)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as ex:
+                list(ex.map(one, todo))
+
+        if has_async_batch:
+            await _run_async_batch()
+        elif has_async_single:
+            await _run_async_fanout()
+        else:
+            # we’re in an async method but provider is sync → run in a thread to not block loop
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _run_sync_threadpool)
+
+        # Return in original order
+        return [scores.get(i, 0.5) for i in range(len(memory_units))]
+
+    def _run_coro_in_loop(self, coro):
+        """
+        Bridge for calling an async coroutine from sync code.
+        Uses current loop if running; else creates a temp loop.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result()

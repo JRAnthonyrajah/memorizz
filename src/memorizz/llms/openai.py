@@ -1,8 +1,12 @@
+# src/memorizz/llms/openai.py
+from __future__ import annotations
 import os
 import json
 import openai
 import logging
-from typing import Callable, List, Optional, TYPE_CHECKING, Dict, Any
+from typing import Callable, List, Optional, TYPE_CHECKING, Dict, Any, Iterable
+import httpx, asyncio
+from openai import AsyncOpenAI
 
 from .llm_provider import LLMProvider
 
@@ -299,3 +303,22 @@ class OpenAI(LLMProvider):
             input=prompt)
         
         return response.output_text
+    
+    async def async_generate_text(self, prompt: str, instructions: Optional[str] = None) -> str:
+        # Using Responses API for latency + stability; adjust if you use ChatCompletions
+        resp = await self.client.responses.create(
+            model=self.model,
+            input=prompt if instructions is None else f"{instructions}\n\n{prompt}",
+            max_output_tokens=64,
+        )
+        return resp.output_text  # works across tool/resp variants in new SDKs
+
+    async def async_generate_batch(
+        self, prompts: Iterable[str], instructions: Optional[str] = None, *, max_concurrency: int = 5
+    ) -> List[str]:
+        sem = asyncio.Semaphore(max_concurrency)
+        async def one(p: str):
+            async with sem:
+                return await self.async_generate_text(p, instructions)
+        return await asyncio.gather(*(one(p) for p in prompts))
+

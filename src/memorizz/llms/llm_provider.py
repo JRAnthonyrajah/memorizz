@@ -1,6 +1,6 @@
 # src/memorizz/llms/llm_provider.py
 
-from typing import Dict, Any, List, Callable, Optional, Protocol, runtime_checkable, TYPE_CHECKING
+from typing import Dict, Any, List, Callable, Optional, Protocol, runtime_checkable, TYPE_CHECKING, Iterable, Awaitable
 
 # Use TYPE_CHECKING to handle forward references for type hints
 if TYPE_CHECKING:
@@ -50,4 +50,10 @@ class LLMProvider(Protocol):
         Returns a serializable dictionary of the provider's configuration.
         This is used for saving and reconstructing the agent.
         """
+        ...
+        
+    # ---- Optional fast paths (implement if you can) ----
+    async def async_generate_text(self, prompt: str, instructions: Optional[str] = None) -> str:
+        ...
+    async def async_generate_batch(self, prompts: Iterable[str], instructions: Optional[str] = None) -> List[str]:
         ...
