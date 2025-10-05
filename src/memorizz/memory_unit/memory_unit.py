@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio, math, re
 import concurrent.futures
 
-from memorizz.src.memorizz import memory_unit
+# from memorizz.src.memorizz import memory_unit
 
 from .conversational_memory_unit import ConversationMemoryUnit
 from ..memory_provider import MemoryProvider
 from ..enums.memory_type import MemoryType
 from ..enums.application_mode import ApplicationMode, ApplicationModeConfig
 from ..embeddings import get_embedding
-from typing import TYPE_CHECKING, Dict, Any, List, Optional, Iterable, Tuple,
+from typing import TYPE_CHECKING, Dict, Any, List, Optional, Iterable, Tuple
 import time
 import numpy as np
 import pprint
@@ -285,11 +285,17 @@ class MemoryUnit:
             self.update_memory_signals_within_memory_unit(mu, memory_type, surrounding_conversation_ids)
 
         # 2) Batch-compute LLM importance once for all units (bounded concurrency; cached)
+        t0 = time.perf_counter()
         importance_scores = self._run_coro_in_loop(
             self._async_importance_batch(memory_units, query, max_concurrency=5)
         )
+        dt_ms = (time.perf_counter() - t0) * 1000
+        logging.getLogger(__name__).info(
+            "[importance.batch] n=%d took=%.1f ms", len(importance_scores), dt_ms
+        )
         for mu, s in zip(memory_units, importance_scores):
             mu["importance"] = float(s)
+
 
         # 3) Now compute the final memory_signal using the pre-filled 'importance'
         for mu in memory_units:
@@ -348,9 +354,15 @@ class MemoryUnit:
             relevance = self.calculate_relevance(query, memory_unit)
 
         # Calulate importance of the memory unit
+        # Importance is expected to be precomputed upstream.
         importance = memory_unit.get("importance")
         if importance is None:
-            importance = self.calculate_importance(memory_unit["content"], query)
+            # Do NOT call the LLM here; that would serialize N requests.
+            importance = 0.5  # neutral default
+            logging.getLogger(__name__).warning(
+                "importance missing; using default=0.5 for mu_id=%s",
+                memory_unit.get("_id") or memory_unit.get("id"),
+            )
 
         # Calculate the normalized memory signal
         memory_signal = recency * number_of_associated_conversation_ids * relevance * importance
@@ -480,6 +492,19 @@ class MemoryUnit:
         # Choose the best available path
         has_async_batch = hasattr(self.llm_provider, "async_generate_batch")
         has_async_single = hasattr(self.llm_provider, "async_generate_text")
+        logger = logging.getLogger(__name__)
+
+        if has_async_batch:
+            logger.info("[importance] using async_generate_batch; todo=%d", len(todo))
+            await _run_async_batch()
+        elif has_async_single:
+            logger.info("[importance] using async fanout; todo=%d max_conc=%d", len(todo), max_concurrency)
+            await _run_async_fanout()
+        else:
+            logger.info("[importance] using sync threadpool; todo=%d max_workers=%d", len(todo), max_concurrency)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _run_sync_threadpool)
+
 
         async def _run_async_batch() -> None:
             # Provider-level batch if implemented

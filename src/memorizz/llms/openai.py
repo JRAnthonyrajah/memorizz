@@ -37,6 +37,13 @@ class OpenAI(LLMProvider):
             api_key = os.getenv("OPENAI_API_KEY")
 
         self.client = openai.OpenAI(api_key=api_key)
+        self._httpx_async = httpx.AsyncClient(
+            http2=True,
+            timeout=httpx.Timeout(connect=3.0, read=18.0, write=10.0, pool=3.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+        # True async OpenAI client
+        self.async_client = AsyncOpenAI(api_key=api_key, http_client=self._httpx_async)
         self.model = model
         
     def get_config(self) -> Dict[str, Any]:
@@ -306,7 +313,7 @@ class OpenAI(LLMProvider):
     
     async def async_generate_text(self, prompt: str, instructions: Optional[str] = None) -> str:
         # Using Responses API for latency + stability; adjust if you use ChatCompletions
-        resp = await self.client.responses.create(
+        resp = await self.async_client.responses.create(
             model=self.model,
             input=prompt if instructions is None else f"{instructions}\n\n{prompt}",
             max_output_tokens=64,
@@ -321,4 +328,8 @@ class OpenAI(LLMProvider):
             async with sem:
                 return await self.async_generate_text(p, instructions)
         return await asyncio.gather(*(one(p) for p in prompts))
+    
+    async def aclose(self):
+        await self._httpx_async.aclose()
+
 
