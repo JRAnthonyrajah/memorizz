@@ -464,12 +464,13 @@ class MemoryUnit:
         *,
         max_concurrency: int = 5,
         instructions: str = "Return only a number in [0,1]."
-        ) -> List[float]:
+    ) -> List[float]:
         """
         Compute LLM-based importance for many memory units in parallel with bounded concurrency.
         Uses provider async methods if available; else threadpooled sync fallback.
         Applies a simple in-proc cache keyed by (mu_id, model, schema_version).
         """
+        logger = logging.getLogger(__name__)
         model = getattr(self.llm_provider, "model", "unknown")
 
         # Build todo list and prefill cached results
@@ -487,27 +488,10 @@ class MemoryUnit:
 
         # Nothing to do?
         if not todo:
-            return [scores[i] if i in scores else 0.5 for i in range(len(memory_units))]
+            return [scores.get(i, 0.5) for i in range(len(memory_units))]
 
-        # Choose the best available path
-        has_async_batch = hasattr(self.llm_provider, "async_generate_batch")
-        has_async_single = hasattr(self.llm_provider, "async_generate_text")
-        logger = logging.getLogger(__name__)
-
-        if has_async_batch:
-            logger.info("[importance] using async_generate_batch; todo=%d", len(todo))
-            await _run_async_batch()
-        elif has_async_single:
-            logger.info("[importance] using async fanout; todo=%d max_conc=%d", len(todo), max_concurrency)
-            await _run_async_fanout()
-        else:
-            logger.info("[importance] using sync threadpool; todo=%d max_workers=%d", len(todo), max_concurrency)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, _run_sync_threadpool)
-
-
-        async def _run_async_batch() -> None:
-            # Provider-level batch if implemented
+        # ---- define helpers FIRST (so no reference-before-definition) ----
+        async def _helper_async_batch() -> None:
             outs = await self.llm_provider.async_generate_batch(  # type: ignore[attr-defined]
                 (p for (_, _, _, p) in todo),
                 instructions=instructions,
@@ -517,7 +501,7 @@ class MemoryUnit:
                 scores[idx] = score
                 _cache_put(mu_id, model, score)
 
-        async def _run_async_fanout() -> None:
+        async def _helper_async_fanout() -> None:
             sem = asyncio.Semaphore(max_concurrency)
             async def one(idx: int, mu_id: str, prompt: str):
                 async with sem:
@@ -529,7 +513,7 @@ class MemoryUnit:
                     _cache_put(mu_id, model, score)
             await asyncio.gather(*(one(idx, mu_id, prompt) for (idx, _, mu_id, prompt) in todo))
 
-        def _run_sync_threadpool() -> None:
+        def _helper_sync_threadpool() -> None:
             def one(args):
                 idx, _, mu_id, prompt = args
                 out = self.llm_provider.generate_text(prompt, instructions=instructions)
@@ -539,17 +523,25 @@ class MemoryUnit:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as ex:
                 list(ex.map(one, todo))
 
+        # ---- decide branch AFTER helpers exist ----
+        has_async_batch = hasattr(self.llm_provider, "async_generate_batch")
+        has_async_single = hasattr(self.llm_provider, "async_generate_text")
+
         if has_async_batch:
-            await _run_async_batch()
+            logger.info("[importance] using async_generate_batch; todo=%d", len(todo))
+            await _helper_async_batch()
         elif has_async_single:
-            await _run_async_fanout()
+            logger.info("[importance] using async fanout; todo=%d max_conc=%d", len(todo), max_concurrency)
+            await _helper_async_fanout()
         else:
-            # we’re in an async method but provider is sync → run in a thread to not block loop
+            logger.info("[importance] using sync threadpool; todo=%d max_workers=%d", len(todo), max_concurrency)
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, _run_sync_threadpool)
+            await loop.run_in_executor(None, _helper_sync_threadpool)
 
         # Return in original order
         return [scores.get(i, 0.5) for i in range(len(memory_units))]
+
+
 
     def _run_coro_in_loop(self, coro):
         """
