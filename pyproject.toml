@@ -24,6 +24,7 @@ dependencies = [
     # NumPy wheels by Python version:
     "numpy==1.21.6; python_version < '3.9'",
     "numpy>=1.26.4,<3.0; python_version >= '3.9'",
+    "httpx[http2]>=0.27,<0.28",
 ]
 
 
