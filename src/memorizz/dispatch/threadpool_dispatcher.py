@@ -16,7 +16,12 @@ class ThreadPoolDispatcher(TaskDispatcher):
         # import lazily to avoid circulars
         from ..memory_provider import MemoryProvider
         def _do():
-            MemoryProvider.store(doc, mem_type=mem_type)
+            for d in docs:
+                try:
+                    MemoryProvider.store(d, mem_type=mem_type)
+                except Exception:
+                    # best-effort; continue
+                    pass
         self.pool.submit(_do)
 
     def enqueue_memory_bulk_write(self, docs: Iterable[Dict[str, Any]], mem_type: Optional[str] = None) -> None:

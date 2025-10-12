@@ -3,6 +3,7 @@ import getpass
 import inspect
 from functools import wraps
 from typing import get_type_hints, List, Dict, Any, Optional
+import hashlib, time as _time
 import pymongo
 from pymongo.collection import Collection
 from pymongo.operations import SearchIndexModel
@@ -225,11 +226,29 @@ class MongoDBTools:
 
             try:
                 vector = self.config.get_embedding(tool_def["description"])
+                # build a stable content hash from the function’s signature/description
+                content_blob = f"{tool_def['name']}|{tool_def['description']}|{tool_def['parameters']}"
+                content_hash = hashlib.sha256(content_blob.encode("utf-8")).hexdigest()
+
+                # if you know the embedding model id, store it (else default)
+                embedding_model_id = getattr(self.config, "embedding_model_id", "default")
+
                 tool_doc = {
                     **tool_def,
-                    "embedding": vector
+                    "embedding": vector,
+                    "content_hash": content_hash,
+                    "embedding_model_id": embedding_model_id,
+                    "created_at": _time.time(),
+                    "schema_version": 1,
+                    "idempotency_key": f"{content_hash}::{embedding_model_id}",
                 }
-                collection.update_one({"name": func.__name__}, {"$set": tool_doc}, upsert=True)
+
+                # upsert by idempotency key (works with your unique index)
+                collection.update_one(
+                    {"idempotency_key": tool_doc["idempotency_key"]},
+                    {"$set": tool_doc},
+                    upsert=True
+                )
                 logger.info(f"Successfully registered tool: {func.__name__}")
             except Exception as e:
                 logger.error(f"Error registering tool {func.__name__}: {str(e)}")

@@ -1200,8 +1200,16 @@ class MongoDBProvider(MemoryProvider):
         List[Dict[str, Any]]
             The conversation history ordered by timestamp.
         """
-        projection = {} if include_embedding else {"embedding": 0}
-        results = list(self.conversation_memory_collection.find({"memory_id": memory_id}, projection).sort("timestamp", 1))
+        if include_embedding:
+            projection = {"_id": 1, "memory_id": 1, "timestamp": 1, "role": 1, "content": 1, "embedding": 1}
+        else:
+            projection = {"_id": 1, "memory_id": 1, "timestamp": 1, "role": 1, "content": 1}
+        results = list(
+            self.conversation_memory_collection
+                .find({"memory_id": memory_id}, projection)
+                .sort("timestamp", 1)
+        )
+
         logger.debug(f"Retrieved {len(results)} conversation items for memory_id: {memory_id}")
         return results
     
