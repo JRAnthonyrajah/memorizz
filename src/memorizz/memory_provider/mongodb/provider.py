@@ -86,6 +86,7 @@ class MongoDBProvider(MemoryProvider):
 
         # Create all memory stores in MongoDB.
         self._create_memory_stores()
+        self._ensure_standard_indexes()
 
         # Create vector indexes immediately only if not using lazy initialization
         if not config.lazy_vector_indexes:
@@ -252,7 +253,42 @@ class MongoDBProvider(MemoryProvider):
                     index_name="vector_index",
                     memory_store=memory_store_present,
                 )
-            
+
+    def _ensure_standard_indexes(self) -> None:
+        self.persona_collection.create_index("name", name="ix_personas_name", background=True)
+        self.toolbox_collection.create_index("name", name="ix_toolbox_name", background=True)
+
+        self.conversation_memory_collection.create_index(
+            [("memory_id", 1), ("timestamp", 1)], name="ix_conversation_memory_scope_ts", background=True
+        )
+        self.workflow_memory_collection.create_index(
+            [("memory_id", 1), ("timestamp", 1)], name="ix_workflow_memory_scope_ts", background=True
+        )
+
+        self.summaries_collection.create_index(
+            [("memory_id", 1), ("period_start", 1), ("period_end", 1)],
+            name="ix_summaries_memory_period", background=True
+        )
+        self.summaries_collection.create_index(
+            [("memory_id", 1), ("created_at", -1)], name="ix_summaries_created_at", background=True
+        )
+
+        self.semantic_cache_collection.create_index(
+            [("agent_id", 1), ("memory_id", 1), ("session_id", 1), ("created_at", -1)],
+            name="ix_semcache_agent_memory_session_created", background=True
+        )
+
+        for coll in (
+            self.persona_collection, self.toolbox_collection, self.short_term_memory_collection,
+            self.long_term_memory_collection, self.conversation_memory_collection,
+            self.workflow_memory_collection, self.shared_memory_collection,
+            self.summaries_collection, self.semantic_cache_collection
+        ):
+            coll.create_index("memory_id", name="ix_memory_id", background=True)
+            coll.create_index("created_at", name="ix_created_at", background=True)
+
+
+       
     def store(self, data: Dict[str, Any], memory_store_type: MemoryType) -> str:
         collection = None
         if memory_store_type == MemoryType.PERSONAS:

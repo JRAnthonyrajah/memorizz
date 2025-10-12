@@ -55,6 +55,7 @@ class MongoDBTools:
                 logger.info(f"Collection '{self.config.collection_name}' created.")
             
             self.tools_collection = self.db[self.config.collection_name]
+            self._ensure_tools_indexes()
 
             # Check if vector search index exists, create if it doesn't
             self._ensure_vector_search_index()
@@ -73,6 +74,66 @@ class MongoDBTools:
         
         if self.tools_collection is None:
             logger.warning("MongoDBTools initialization failed. Some features may not work.")
+    
+
+    # --- add this helper somewhere in your class (e.g., right under __init__) ---
+    def _ensure_tools_indexes(self) -> None:
+        """
+        Standard (non-vector) indexes for the tools collection.
+        Safe to call multiple times.
+        """
+
+        # 1) Lookup by name (exact name filters, quick listing)
+        # db.tools.createIndex({ name: 1 })
+        self.tools_collection.create_index(
+            "name", name="ix_tools_name", background=True
+        )
+
+        # 2) Prevent duplicate tool rows for the same code content + embedding model
+        #    (pairs are unique). This also accelerates lookups by these fields.
+        # db.tools.createIndex({ content_hash: 1, embedding_model_id: 1 }, { unique: true })
+        self.tools_collection.create_index(
+            [("content_hash", 1), ("embedding_model_id", 1)],
+            name="ux_tools_contenthash_model",
+            unique=True,
+            background=True,
+        )
+
+        # 3) Chronological queries (recent tools first, or pruning by time)
+        # db.tools.createIndex({ created_at: -1 })
+        self.tools_collection.create_index(
+            [("created_at", -1)],
+            name="ix_tools_created_at_desc",
+            background=True,
+        )
+
+        # 4) Optional scope filters (only if you set these fields on tool docs)
+        #    Useful when you want "this agent’s / memory’s tools only".
+        # db.tools.createIndex({ agent_id: 1, memory_id: 1 })
+        try:
+            self.tools_collection.create_index(
+                [("agent_id", 1), ("memory_id", 1)],
+                name="ix_tools_agent_memory",
+                background=True,
+            )
+        except Exception:
+            # If you don't use agent_id/memory_id on tools, this will be harmless.
+            pass
+
+        # 5) Idempotency key (if you write with an 'idempotency_key' on each tool)
+        # db.tools.createIndex({ idempotency_key: 1 }, { unique: true, sparse: true })
+        try:
+            self.tools_collection.create_index(
+                "idempotency_key",
+                name="ux_tools_idem",
+                unique=True,
+                sparse=True,
+                background=True,
+            )
+        except Exception:
+            pass
+
+
     
     def _get_embedding_dimensions(self) -> int:
         """

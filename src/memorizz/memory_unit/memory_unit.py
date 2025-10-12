@@ -10,6 +10,10 @@ from ..memory_provider import MemoryProvider
 from ..enums.memory_type import MemoryType
 from ..enums.application_mode import ApplicationMode, ApplicationModeConfig
 from ..embeddings import get_embedding
+from ..dispatch.task_dispatcher import get_global_dispatcher
+from ..concurrency.executors import run_io
+
+
 from typing import TYPE_CHECKING, Dict, Any, List, Optional, Iterable, Tuple
 import time
 import numpy as np
@@ -25,7 +29,7 @@ def get_openai_llm():
 
 
 _FLOAT_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
-
+dispatcher = get_global_dispatcher()
 
 def _parse_float(s: str, default: float = 0.5) -> float:
     m = _FLOAT_RE.search(str(s))
@@ -98,7 +102,15 @@ class MemoryUnit:
         """
 
         # Generate the embedding of the memory unit
-        content["embedding"] = get_embedding(content["content"])
+        try:
+            # Transitional: compute now if your MU constructor requires an embedding field synchronously.
+            content["embedding"] = dispatcher.compute_embedding_blocking(content["content"], meta={"where":"memory_unit.generate"})
+        except Exception:
+            # Fail-soft: do not block the read path if embedding fails.
+            content["embedding"] = None
+            dispatcher.enqueue_embedding_compute(
+                content["content"], meta={"where": "memory_unit.generate", "mu_meta": {"type": content.get("type")}}
+            )
 
         # Determine the appropriate memory unit type based on content and active memory types
         if MemoryType.CONVERSATION_MEMORY in self.active_memory_types and "role" in content:
@@ -225,9 +237,13 @@ class MemoryUnit:
 
         logger = logging.getLogger(__name__)
         
-        logger.info(f"Storing memory unit of type {memory_type.value} in memory provider")
+        logger.info(f"Queueing memory unit of type {memory_type.value} for background store")
         logger.debug(f"Memory component data: {memory_unit_dict}")
-        stored_id = self.memory_provider.store(memory_unit_dict, memory_type)
+        # Offload the write; do not block the read path
+        get_global_dispatcher().enqueue_memory_write(memory_unit_dict, memory_type)
+        # Maintain API shape: return the best available identifier without waiting
+        stored_id = memory_unit_dict.get("_id") or memory_unit_dict.get("id")
+        
         logger.info(f"Stored memory unit with ID: {stored_id}")
         return stored_id
 
@@ -268,7 +284,15 @@ class MemoryUnit:
         """
 
         # Create the query embedding here so that it is not created for each memory unit
-        self.query_embedding = get_embedding(query)
+        dispatcher = get_global_dispatcher()
+        try:
+            self.query_embedding = dispatcher.compute_embedding_blocking(
+                query, meta={"where": "memory_unit.retrieve.query"}
+            )
+        except Exception:
+            self.query_embedding = None
+            dispatcher.enqueue_embedding_compute(query, meta={"where": "memory_unit.retrieve.query"})
+            # Fallback: a neutral later step will handle missing embedding gracefully.
 
         # Get the memory units by query
         memory_units = self.memory_provider.retrieve_memory_units_by_query(query, self.query_embedding, memory_id, memory_type, limit)
@@ -284,17 +308,23 @@ class MemoryUnit:
         for mu in memory_units:
             self.update_memory_signals_within_memory_unit(mu, memory_type, surrounding_conversation_ids)
 
-        # 2) Batch-compute LLM importance once for all units (bounded concurrency; cached)
-        t0 = time.perf_counter()
-        importance_scores = self._run_coro_in_loop(
-            self._async_importance_batch(memory_units, query, max_concurrency=5)
-        )
-        dt_ms = (time.perf_counter() - t0) * 1000
-        logging.getLogger(__name__).info(
-            "[importance.batch] n=%d took=%.1f ms", len(importance_scores), dt_ms
-        )
-        for mu, s in zip(memory_units, importance_scores):
-            mu["importance"] = float(s)
+        # 2) Importance via background task to avoid blocking the read path.
+        #    Use neutral default now; background reranker can upsert later.
+        dispatcher = get_global_dispatcher()
+        try:
+            dispatcher.enqueue_importance_compute(
+                items=[mu if isinstance(mu, dict) else getattr(mu, "model_dump", lambda: mu)() for mu in memory_units],
+                query=query,
+                meta={"where": "memory_unit.retrieve.importance_batch", "memory_id": memory_id if "memory_id" in locals() else None}
+            )
+        except Exception:
+            # Best-effort only; continue without blocking
+            pass
+
+        for mu in memory_units:
+            # If no precomputed importance present, set neutral default.
+            if mu.get("importance") is None:
+                mu["importance"] = 0.5
 
 
         # 3) Now compute the final memory_signal using the pre-filled 'importance'
@@ -308,6 +338,63 @@ class MemoryUnit:
         # Return the memory units
         return memory_units
     
+
+    async def retrieve_memory_units_by_query_async(
+        self,
+        query: str,
+        memory_id: str,
+        memory_type: MemoryType,
+        limit: int = 5,
+    ):
+        """
+        Async version of retrieval:
+        - Offloads sync provider calls with asyncio.to_thread
+        - Avoids any LLM fan-out or blocking work (importance is enqueued)
+        """
+        dispatcher = get_global_dispatcher()
+
+        # Query embedding (fail-soft; offload long work)
+        try:
+            query_embedding = dispatcher.compute_embedding_blocking(
+                query, meta={"where": "memory_unit.retrieve.query"}
+            )
+        except Exception:
+            query_embedding = None
+            dispatcher.enqueue_embedding_compute(query, meta={"where": "memory_unit.retrieve.query"})
+
+        # Provider retrieval may be synchronous; run it in a worker thread
+        memory_units = await run_io(
+            self.memory_provider.retrieve_memory_units_by_query,
+            query,
+            query_embedding,
+            memory_id,
+            memory_type,
+            limit,
+        )
+
+        # Prepare surrounding conversation ids
+        surrounding_conversation_ids = [mu["_id"] for mu in memory_units]
+
+        # Update cheap, local signals now (no I/O or LLMs)
+        for mu in memory_units:
+            self.update_memory_signals_within_memory_unit(mu, memory_type, surrounding_conversation_ids)
+
+        # Enqueue importance in the background; set neutral default now
+        try:
+            dispatcher.enqueue_importance_compute(
+                items=[mu for mu in memory_units],
+                query=query,
+                meta={"where": "memory_unit.retrieve.importance_batch", "memory_id": memory_id},
+            )
+        except Exception:
+            pass
+        for mu in memory_units:
+            if mu.get("importance") is None:
+                mu["importance"] = 0.5
+
+        return memory_units
+
+
 
     def update_memory_signals_within_memory_unit(self, memory_unit: any, memory_type: MemoryType, surrounding_conversation_ids: list[str]):
         """
@@ -385,17 +472,38 @@ class MemoryUnit:
             float: The relevance between 0 and 1.
         """
         # Get embedding of the query
+        dispatcher = get_global_dispatcher()
         if self.query_embedding is None:
-            self.query_embedding = get_embedding(query)
+            try:
+                self.query_embedding = dispatcher.compute_embedding_blocking(
+                    query, meta={"where": "memory_unit.calculate_relevance.query"}
+                )
+            except Exception:
+                self.query_embedding = None
+                dispatcher.enqueue_embedding_compute(query, meta={"where": "memory_unit.calculate_relevance.query"})
 
         # Get embedding of the memory unit if it is not already embedded
         if "embedding" not in memory_unit or memory_unit["embedding"] is None:
-            memory_unit_embedding = get_embedding(memory_unit["content"])
+            try:
+                memory_unit_embedding = dispatcher.compute_embedding_blocking(
+                    memory_unit["content"], meta={"where": "memory_unit.calculate_relevance.mu"}
+                )
+            except Exception:
+                memory_unit_embedding = None
+                dispatcher.enqueue_embedding_compute(
+                    memory_unit["content"],
+                    meta={"where": "memory_unit.calculate_relevance.mu", "target_id": memory_unit.get("_id") or memory_unit.get("id")}
+                )
         else:
             memory_unit_embedding = memory_unit["embedding"]
 
         # Calculate the cosine similarity between the query embedding and the memory unit embedding
-        relevance = self.cosine_similarity(self.query_embedding, memory_unit_embedding)
+        if self.query_embedding is None or memory_unit_embedding is None:
+            # Neutral fallback to avoid blocking / exceptions
+            relevance = 0.5
+        else:
+            relevance = self.cosine_similarity(self.query_embedding, memory_unit_embedding)
+
 
         # Return the relevance
         return relevance
@@ -544,10 +652,7 @@ class MemoryUnit:
 
 
     def _run_coro_in_loop(self, coro):
-        """
-        Bridge for calling an async coroutine from sync code.
-        Uses current loop if running; else creates a temp loop.
-        """
+        """DEPRECATED: do not use. Retrieval is async; importance is offloaded."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
