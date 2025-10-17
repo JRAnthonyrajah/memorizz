@@ -233,4 +233,28 @@ def get_embedding_dimensions(model: Optional[str] = None) -> int:
     int
         The number of dimensions in the embedding vector
     """
-    return get_embedding_manager().get_dimensions() 
+    return get_embedding_manager().get_dimensions()
+
+
+# Async embedding functions (requires torch and motor)
+try:
+    from .async_provider import (
+        AsyncEmbeddingProvider,
+        get_async_embedding_provider,
+        get_embedding_async,
+        get_embeddings_batch_async
+    )
+    _ASYNC_AVAILABLE = True
+except ImportError:
+    _ASYNC_AVAILABLE = False
+    # Provide helpful error message if user tries to use async functions
+    def _async_not_available(*args, **kwargs):
+        raise ImportError(
+            "Async embedding functions require torch and motor. "
+            "Install with: pip install 'memorizz[gpu]' or 'memorizz[performance]'"
+        )
+
+    get_embedding_async = _async_not_available
+    get_embeddings_batch_async = _async_not_available
+    get_async_embedding_provider = _async_not_available
+    AsyncEmbeddingProvider = None 

@@ -649,6 +649,135 @@ class MemoryUnit:
         # Return in original order
         return [scores.get(i, 0.5) for i in range(len(memory_units))]
 
+    async def retrieve_all_memory_types_async(
+        self,
+        query: str,
+        memory_id: str,
+        limits: Dict[MemoryType, int],
+        async_memory_provider = None
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Retrieve ALL memory types in PARALLEL with a SINGLE embedding computation.
+
+        This is the key optimization for high-performance context building:
+        1. Compute query embedding ONCE
+        2. Query all memory types in PARALLEL
+        3. Post-process results concurrently
+
+        Parameters:
+        -----------
+        query : str
+            User query text
+        memory_id : str
+            Memory ID to filter by
+        limits : Dict[MemoryType, int]
+            Dict mapping MemoryType to result limit
+        async_memory_provider : AsyncMongoDBProvider, optional
+            Async provider to use. If None, uses sync provider with executor.
+
+        Returns:
+        --------
+        Dict[str, List[Dict[str, Any]]]
+            Dict mapping memory type names to result lists
+
+        Example:
+        --------
+        ```python
+        from memorizz.memory_provider.mongodb.async_provider import AsyncMongoDBProvider
+
+        async_provider = AsyncMongoDBProvider(config)
+        mu = MemoryUnit('conversational', memory_provider=provider)
+
+        results = await mu.retrieve_all_memory_types_async(
+            query="What is machine learning?",
+            memory_id="user123",
+            limits={
+                MemoryType.LONG_TERM_MEMORY: 5,
+                MemoryType.CONVERSATION_MEMORY: 5,
+                MemoryType.PROCEDURAL_MEMORY: 5,
+            },
+            async_memory_provider=async_provider
+        )
+
+        semantic = results.get('LONG_TERM_MEMORY', [])
+        episodic = results.get('CONVERSATION_MEMORY', [])
+        ```
+        """
+
+        # 1. Compute embedding ONCE for all queries
+        from ..embeddings import get_embedding_async
+        try:
+            query_embedding = await get_embedding_async(query)
+        except ImportError:
+            # Fallback to sync if async not available
+            from ..embeddings import get_embedding
+            query_embedding = get_embedding(query)
+
+        # 2. Build batch query specifications
+        batch_queries = []
+        for mem_type, limit in limits.items():
+            if mem_type is None or limit <= 0:
+                continue
+
+            batch_queries.append({
+                'key': mem_type.value,
+                'query': query,
+                'embedding': query_embedding,  # Reuse same embedding!
+                'memory_id': memory_id,
+                'memory_type': mem_type,
+                'limit': limit
+            })
+
+        # 3. Execute ALL queries in PARALLEL
+        if async_memory_provider:
+            # Use async provider's batch API
+            results = await async_memory_provider.batch_retrieve_async(batch_queries)
+        else:
+            # Fallback: run sync provider in parallel executors
+            loop = asyncio.get_event_loop()
+            tasks = []
+
+            for q in batch_queries:
+                task = loop.run_in_executor(
+                    None,  # Default executor
+                    self.memory_provider.retrieve_memory_units_by_query,
+                    q['query'],
+                    q['embedding'],
+                    q['memory_id'],
+                    q['memory_type'],
+                    q['limit']
+                )
+                tasks.append(task)
+
+            batch_results = await asyncio.gather(*tasks)
+            results = {
+                batch_queries[i]['key']: batch_results[i]
+                for i in range(len(batch_queries))
+            }
+
+        # 4. Post-process: Add memory signals in PARALLEL
+        async def add_memory_signals(
+            key: str,
+            mems: List[Dict]
+        ) -> tuple:
+            """Calculate memory signals for a list of memories"""
+            for mu in mems:
+                mu["memory_signal"] = self.calculate_memory_signal(mu, query)
+
+            # Sort by memory signal
+            mems.sort(key=lambda x: x["memory_signal"], reverse=True)
+
+            return key, mems
+
+        # Run signal calculation in parallel
+        signal_tasks = [
+            add_memory_signals(k, v)
+            for k, v in results.items()
+        ]
+        processed = await asyncio.gather(*signal_tasks)
+
+        return dict(processed)
+
 
 
     def _run_coro_in_loop(self, coro):

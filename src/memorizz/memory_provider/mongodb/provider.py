@@ -65,7 +65,21 @@ class MongoDBProvider(MemoryProvider):
             - 'embedding_provider': Optional explicit embedding provider
         """
         self.config = config
-        self.client = MongoClient(config.uri)
+        # Enhanced connection pooling configuration
+        self.client = MongoClient(
+            config.uri,
+            maxPoolSize=50,           # Max concurrent connections
+            minPoolSize=10,           # Keep 10 connections warm
+            maxIdleTimeMS=60000,      # 1 min idle timeout
+            waitQueueTimeoutMS=5000,  # 5s wait for connection
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=20000,
+            retryWrites=True,
+            retryReads=True,
+            # Connection pool monitoring
+            appname='memorizz'
+        )
         self.db = self.client[config.db_name]
         self.persona_collection = self.db[MemoryType.PERSONAS.value]
         self.toolbox_collection = self.db[MemoryType.TOOLBOX.value]
