@@ -4,7 +4,7 @@ import os
 import json
 import openai
 import logging
-from typing import Callable, List, Optional, TYPE_CHECKING, Dict, Any, Iterable
+from typing import Callable, List, Optional, TYPE_CHECKING, Dict, Any, Iterable, AsyncIterator
 import httpx, asyncio
 from openai import AsyncOpenAI
 
@@ -328,7 +328,35 @@ class OpenAI(LLMProvider):
             async with sem:
                 return await self.async_generate_text(p, instructions)
         return await asyncio.gather(*(one(p) for p in prompts))
-    
+
+    async def async_stream_text(self, prompt: str, instructions: Optional[str] = None) -> AsyncIterator[str]:
+        """
+        Stream text generation in chunks as they arrive from the LLM.
+
+        Parameters:
+            prompt: The prompt to generate text from
+            instructions: Optional system instructions
+
+        Yields:
+            str: Text chunks as they are generated
+        """
+        messages = []
+        if instructions:
+            messages.append({"role": "system", "content": instructions})
+        messages.append({"role": "user", "content": prompt})
+
+        stream = await self.async_client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            stream=True
+        )
+
+        async for chunk in stream:
+            if chunk.choices and len(chunk.choices) > 0:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    yield delta.content
+
     async def aclose(self):
         await self._httpx_async.aclose()
 

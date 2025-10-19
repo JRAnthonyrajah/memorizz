@@ -1,6 +1,6 @@
 # src/memorizz/llms/llm_provider.py
 
-from typing import Dict, Any, List, Callable, Optional, Protocol, runtime_checkable, TYPE_CHECKING, Iterable, Awaitable
+from typing import Dict, Any, List, Callable, Optional, Protocol, runtime_checkable, TYPE_CHECKING, Iterable, Awaitable, AsyncIterator
 
 # Use TYPE_CHECKING to handle forward references for type hints
 if TYPE_CHECKING:
@@ -56,4 +56,16 @@ class LLMProvider(Protocol):
     async def async_generate_text(self, prompt: str, instructions: Optional[str] = None) -> str:
         ...
     async def async_generate_batch(self, prompts: Iterable[str], instructions: Optional[str] = None) -> List[str]:
+        ...
+    async def async_stream_text(self, prompt: str, instructions: Optional[str] = None) -> AsyncIterator[str]:
+        """
+        Stream text generation in chunks as they arrive from the LLM.
+
+        Parameters:
+            prompt: The prompt to generate text from
+            instructions: Optional system instructions
+
+        Yields:
+            str: Text chunks as they are generated
+        """
         ...
