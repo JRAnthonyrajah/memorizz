@@ -1560,8 +1560,12 @@ class MemAgent:
             tool_id = str(tool_entry.get("_id"))
             tool_spec = None
 
+            # Try to get ToolSpec from Toolbox
             if isinstance(self.tools, Toolbox):
                 tool_spec = self.tools.get_tool_spec_by_id(tool_id)
+            elif hasattr(self, '_toolbox_instance') and hasattr(self._toolbox_instance, 'get_tool_spec_by_id'):
+                # Agent has a reference to the original toolbox instance
+                tool_spec = self._toolbox_instance.get_tool_spec_by_id(tool_id)
 
             # If no ToolSpec available, fall back to serial execution
             if not tool_spec:
