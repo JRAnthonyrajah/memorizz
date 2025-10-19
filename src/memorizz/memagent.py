@@ -58,7 +58,8 @@ class MemAgentModel(BaseModel):
     embedding_config: Optional[Dict[str, Any]] = None
     semantic_cache: Optional[bool] = False  # Enable semantic cache
     semantic_cache_config: Optional[Union[SemanticCacheConfig, Dict[str, Any]]] = None  # Semantic cache configuration
-    
+    enable_planning: Optional[bool] = False  # Enable concurrent plan execution with planner_exec
+
     model_config = {
         "arbitrary_types_allowed": True  # Allow arbitrary types like Toolbox
     }
@@ -293,8 +294,8 @@ class MemAgent:
         self.agent_id = agent_id
 
         # Enable planning mode for concurrent tool execution
-        self.enable_planning = enable_planning
-        if enable_planning and not isinstance(tools, Toolbox):
+        self.enable_planning = enable_planning if enable_planning is not None else False
+        if self.enable_planning and not isinstance(tools, Toolbox):
             logger.warning("enable_planning is True but tools is not a Toolbox. Planning mode requires a Toolbox instance.")
 
         # Conversation ID persistence: Store current conversation_id to reuse across runs
@@ -1091,7 +1092,8 @@ class MemAgent:
 
             if tool_calls:
                 # Handle tool execution (synchronous, not streaming)
-                if self.enable_planning:
+                # Use getattr for backward compatibility with agents that don't have enable_planning
+                if getattr(self, 'enable_planning', False):
                     # Use async plan execution with concurrent tool execution
                     try:
                         # Check if we're already in an async context
@@ -1454,7 +1456,8 @@ class MemAgent:
 
             if tool_calls:
                 # Handle tool execution
-                if self.enable_planning:
+                # Use getattr for backward compatibility with agents that don't have enable_planning
+                if getattr(self, 'enable_planning', False):
                     # Use async plan execution with concurrent tool execution
                     try:
                         # Check if we're already in an async context
