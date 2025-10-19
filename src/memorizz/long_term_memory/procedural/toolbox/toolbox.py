@@ -2,7 +2,7 @@
 # This refactored code adds support for any LLM provider while maintaining
 # full backward compatibility with the original OpenAI implementation.
 
-from typing import Dict, Any, List, Callable, Optional, Union, Protocol, Mapping
+from typing import Dict, Any, List, Callable, Optional, Union, Protocol, Mapping, Set
 from ....memory_provider import MemoryProvider
 from ....enums.memory_type import MemoryType
 from ....embeddings import get_embedding
@@ -13,6 +13,7 @@ import logging
 import json
 import hashlib, time
 from dataclasses import asdict
+from ....planner_exec import ToolSpec, ResourceSpec, LatencyClass
 
 
 logging.basicConfig(level=logging.INFO)
@@ -91,14 +92,28 @@ class Toolbox:
         self._tools: Dict[str, Callable] = {}
         self._by_name: dict[str, list[str]] = {}
         self._by_fqn: dict[str, str] = {}
+
+        # Storage for ToolSpec metadata (for planner_exec integration)
+        self._tool_specs: Dict[str, ToolSpec] = {}
         
 
 
 
-    def register_tool(self, func: Optional[Callable] = None, augment: bool = False) -> Union[str, Callable]:
+    def register_tool(
+        self,
+        func: Optional[Callable] = None,
+        augment: bool = False,
+        # ToolSpec parameters for planner_exec integration
+        reads: Optional[Set[str]] = None,
+        writes: Optional[Set[str]] = None,
+        idempotent: bool = False,
+        concurrency_cap: Optional[int] = None,
+        latency_class: LatencyClass = LatencyClass.MEDIUM,
+        timeout: Optional[float] = None,
+    ) -> Union[str, Callable]:
         """
         Register a function as a tool in the toolbox.
-        
+
         Parameters:
         -----------
         func : Callable, optional
@@ -106,6 +121,19 @@ class Toolbox:
         augment : bool, optional
             Whether to augment the tool docstring and generate synthetic queries
             using the configured LLM provider.
+        reads : Set[str], optional
+            Set of resources this tool reads from (e.g., {"database:users"})
+        writes : Set[str], optional
+            Set of resources this tool writes to (e.g., {"cache:user_data"})
+        idempotent : bool, optional
+            Whether the tool can safely be retried on failure
+        concurrency_cap : int, optional
+            Maximum number of concurrent executions (None = unlimited)
+        latency_class : LatencyClass, optional
+            Expected latency class for planning purposes
+        timeout : float, optional
+            Maximum execution time in seconds (None = no timeout)
+
         Returns:
         --------
         Union[str, Callable]
@@ -123,7 +151,7 @@ class Toolbox:
                 queries = self._generate_queries(augmented_docstring)
                 embedding = get_embedding(f"{f.__name__} {augmented_docstring} {signature} {queries}")
                 tool_data = self._get_tool_metadata(f)
-                
+
                 tool_dict = {
                     "_id": object_id,
                     "embedding": embedding,
@@ -133,15 +161,33 @@ class Toolbox:
             else:
                 embedding = get_embedding(f"{f.__name__} {docstring} {signature}")
                 tool_data = self._get_tool_metadata(f)
-                
+
                 tool_dict = {
                     "_id": object_id,
                     "embedding": embedding,
                     **tool_data.model_dump()
                 }
-            
+
             self.memory_provider.store(tool_dict, memory_store_type=MemoryType.TOOLBOX)
             self._tools[object_id_str] = f
+
+            # Create and store ToolSpec if any planner_exec parameters are provided
+            if reads or writes or idempotent or concurrency_cap or timeout or latency_class != LatencyClass.MEDIUM:
+                tool_spec = ToolSpec(
+                    name=f.__name__,
+                    func=f,
+                    resources=ResourceSpec(
+                        reads=frozenset(reads or set()),
+                        writes=frozenset(writes or set())
+                    ),
+                    idempotent=idempotent,
+                    concurrency_cap=concurrency_cap,
+                    latency_class=latency_class,
+                    timeout=timeout,
+                    description=docstring.strip().split('\n')[0] if docstring else ""
+                )
+                self._tool_specs[object_id_str] = tool_spec
+
             return object_id_str
 
         if func is None:
@@ -244,7 +290,7 @@ class Toolbox:
         -----------
         id : str
             The id of the tool to delete.
-        
+
         Returns:
         --------
         bool
@@ -252,7 +298,9 @@ class Toolbox:
         """
         if id in self._tools:
             del self._tools[id]
-        
+        if id in self._tool_specs:
+            del self._tool_specs[id]
+
         return self.memory_provider.delete_by_id(id, memory_store_type=MemoryType.TOOLBOX)
     
     def delete_all(self) -> bool:
@@ -265,6 +313,7 @@ class Toolbox:
             True if deletion was successful, False otherwise.
         """
         self._tools.clear()
+        self._tool_specs.clear()
         return self.memory_provider.delete_all(memory_store_type=MemoryType.TOOLBOX)
     
     def list_tools(self) -> List[Dict[str, Any]]:
@@ -297,18 +346,50 @@ class Toolbox:
     def get_function_by_id(self, tool_id: str) -> Optional[Callable]:
         """
         Get the actual executable function by its tool ID.
-        
+
         Parameters:
         -----------
         tool_id : str
             The ID of the tool whose function to retrieve.
-        
+
         Returns:
         --------
         Optional[Callable]
             The function object, or None if not found in the current session.
         """
         return self._tools.get(tool_id)
+
+    def get_tool_spec_by_id(self, tool_id: str) -> Optional[ToolSpec]:
+        """
+        Get the ToolSpec for a tool by its ID.
+
+        Parameters:
+        -----------
+        tool_id : str
+            The ID of the tool whose ToolSpec to retrieve.
+
+        Returns:
+        --------
+        Optional[ToolSpec]
+            The ToolSpec object, or None if not found or not registered with planner_exec support.
+        """
+        return self._tool_specs.get(tool_id)
+
+    def has_tool_spec(self, tool_id: str) -> bool:
+        """
+        Check if a tool has a ToolSpec registered.
+
+        Parameters:
+        -----------
+        tool_id : str
+            The ID of the tool to check.
+
+        Returns:
+        --------
+        bool
+            True if the tool has a ToolSpec, False otherwise.
+        """
+        return tool_id in self._tool_specs
 
     def update_tool_by_id(self, id: str, data: Dict[str, Any]) -> bool:
         """

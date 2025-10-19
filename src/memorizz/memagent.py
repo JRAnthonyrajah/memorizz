@@ -2,6 +2,7 @@ import uuid
 import json
 import logging
 import os
+import asyncio
 from datetime import datetime
 from typing import Optional, Union, List, Dict, Any, AsyncIterator
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from .long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
 from .long_term_memory.semantic.persona.persona import Persona
 from .embeddings import configure_embeddings
 from typing import Callable
+from .planner_exec import PlanStep, run_plan, ExecutionError, ToolSpec
 
 # Configure logging based on environment variable
 MEMORIZZ_LOG_LEVEL = os.getenv('MEMORIZZ_LOG_LEVEL', 'DEBUG').upper()
@@ -82,7 +84,8 @@ class MemAgent:
         embedding_provider: Optional[str] = None, # Embedding provider to use (openai, ollama)
         embedding_config: Optional[Dict[str, Any]] = None, # Configuration for the embedding provider
         semantic_cache: bool = False, # Enable semantic cache for query-response caching
-        semantic_cache_config: Optional[Union[SemanticCacheConfig, Dict[str, Any]]] = None # Configuration for semantic cache
+        semantic_cache_config: Optional[Union[SemanticCacheConfig, Dict[str, Any]]] = None, # Configuration for semantic cache
+        enable_planning: bool = False, # Enable concurrent plan execution with planner_exec
     ):
         # If the memory provider is not provided, then we use the default memory provider
         if memory_provider is None:
@@ -288,7 +291,12 @@ class MemAgent:
             self.memory_ids = memory_ids
             
         self.agent_id = agent_id
-        
+
+        # Enable planning mode for concurrent tool execution
+        self.enable_planning = enable_planning
+        if enable_planning and not isinstance(tools, Toolbox):
+            logger.warning("enable_planning is True but tools is not a Toolbox. Planning mode requires a Toolbox instance.")
+
         # Conversation ID persistence: Store current conversation_id to reuse across runs
         # This fixes the issue where each run() generates a new conversation_id
         self._current_conversation_id = None
@@ -1360,7 +1368,24 @@ class MemAgent:
 
             if tool_calls:
                 # Handle tool execution
-                messages = self._handle_tool_calls(tool_calls, messages, query, memory_id, tool_metas)
+                if self.enable_planning:
+                    # Use async plan execution with concurrent tool execution
+                    try:
+                        # Check if we're already in an async context
+                        loop = asyncio.get_running_loop()
+                        # We're in an async context, create a task
+                        task = asyncio.create_task(
+                            self._execute_plan_mode(tool_calls, messages, query, memory_id, tool_metas)
+                        )
+                        messages = asyncio.run(asyncio.wait_for(task, timeout=None))
+                    except RuntimeError:
+                        # No running loop, create one
+                        messages = asyncio.run(
+                            self._execute_plan_mode(tool_calls, messages, query, memory_id, tool_metas)
+                        )
+                else:
+                    # Use traditional serial execution
+                    messages = self._handle_tool_calls(tool_calls, messages, query, memory_id, tool_metas)
                 continue
 
             # h) No function calls → final answer
@@ -1401,17 +1426,118 @@ class MemAgent:
         else:
             return [], "none"
 
-    def _handle_tool_calls(self, tool_calls: List, messages: List[Dict], query: str, memory_id: str, tool_metas: List[Dict]) -> List[Dict]:
+    async def _execute_plan_mode(
+        self,
+        tool_calls: List,
+        messages: List[Dict],
+        query: str,
+        memory_id: str,
+        tool_metas: List[Dict]
+    ) -> List[Dict]:
         """
-        Handle execution of tool function calls.
-        
+        Execute tool calls using the planner/executor system for concurrent execution.
+
+        This enables concurrent execution with proper dependency tracking and resource management.
+
         Parameters:
             tool_calls (List): The tool calls from the LLM.
             messages (List[Dict]): The current conversation messages.
             query (str): The original user query.
             memory_id (str): The memory ID.
             tool_metas (List[Dict]): The available tool metadata.
-            
+
+        Returns:
+            List[Dict]: Updated messages with tool results.
+        """
+        logger.info(f"Executing {len(tool_calls)} tool calls in planning mode")
+
+        # Convert tool calls to PlanSteps
+        steps = []
+        tool_call_map = {}  # Map step_id to call for result association
+
+        for idx, call in enumerate(tool_calls):
+            name = call.name
+            try:
+                args = json.loads(call.arguments)
+            except Exception:
+                args = {}
+
+            # Get tool spec from toolbox
+            tool_entry = next((meta for meta in tool_metas if meta["name"] == name), None)
+            if not tool_entry:
+                logger.warning(f"Tool {name} not found in tool_metas, falling back to serial execution")
+                return self._handle_tool_calls(tool_calls, messages, query, memory_id, tool_metas)
+
+            tool_id = str(tool_entry.get("_id"))
+            tool_spec = None
+
+            if isinstance(self.tools, Toolbox):
+                tool_spec = self.tools.get_tool_spec_by_id(tool_id)
+
+            # If no ToolSpec available, fall back to serial execution
+            if not tool_spec:
+                logger.warning(f"Tool {name} has no ToolSpec, falling back to serial execution")
+                return self._handle_tool_calls(tool_calls, messages, query, memory_id, tool_metas)
+
+            # Create plan step
+            step_id = f"step_{idx}_{name}"
+            step = PlanStep(
+                step_id=step_id,
+                tool=tool_spec,
+                args=args,
+                produces={f"result_{idx}"}
+            )
+            steps.append(step)
+            tool_call_map[step_id] = (idx, call)
+
+        # Execute plan concurrently
+        try:
+            logger.info(f"Starting concurrent execution of {len(steps)} plan steps")
+            artifacts = await run_plan(steps, max_retries=3, default_timeout=60.0)
+
+            # Convert results back to messages format
+            for step in steps:
+                idx, call = tool_call_map[step.step_id]
+                result = artifacts.get(f"result_{idx}", "No result")
+
+                messages.append({
+                    "type": "function_call",
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                })
+
+                messages.append({
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": str(result),
+                })
+
+            logger.info(f"Successfully completed concurrent execution of {len(steps)} tools")
+            return messages
+
+        except ExecutionError as e:
+            logger.error(f"Plan execution failed: {e}")
+            # Add error to messages
+            for call in tool_calls:
+                messages.append({
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": f"Error: {e}",
+                })
+            return messages
+
+    def _handle_tool_calls(self, tool_calls: List, messages: List[Dict], query: str, memory_id: str, tool_metas: List[Dict]) -> List[Dict]:
+        """
+        Handle execution of tool function calls.
+
+        Parameters:
+            tool_calls (List): The tool calls from the LLM.
+            messages (List[Dict]): The current conversation messages.
+            query (str): The original user query.
+            memory_id (str): The memory ID.
+            tool_metas (List[Dict]): The available tool metadata.
+
         Returns:
             List[Dict]: Updated messages with tool results.
         """
