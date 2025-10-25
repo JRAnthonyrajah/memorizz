@@ -72,44 +72,64 @@ class ResourceLockManager:
 
     async def acquire_read(self, resource: str) -> None:
         """Acquire a read lock on a resource."""
+        logger.debug(f"[LOCK_MGR] Requesting READ lock on '{resource}'")
+
         if resource not in self._condition:
+            logger.debug(f"[LOCK_MGR] Initializing lock structures for '{resource}'")
             self._condition[resource] = asyncio.Condition()
             self._reader_counts[resource] = 0
             self._writer_active[resource] = False
 
         async with self._condition[resource]:
             # Wait while a writer is active
+            if self._writer_active[resource]:
+                logger.debug(f"[LOCK_MGR] Waiting for writer to release '{resource}'")
             while self._writer_active[resource]:
                 await self._condition[resource].wait()
 
             self._reader_counts[resource] += 1
+            logger.debug(f"[LOCK_MGR] Acquired READ lock on '{resource}' (reader_count={self._reader_counts[resource]})")
 
     async def release_read(self, resource: str) -> None:
         """Release a read lock on a resource."""
+        logger.debug(f"[LOCK_MGR] Releasing READ lock on '{resource}'")
         async with self._condition[resource]:
             self._reader_counts[resource] -= 1
+            logger.debug(f"[LOCK_MGR] Released READ lock on '{resource}' (reader_count={self._reader_counts[resource]})")
             if self._reader_counts[resource] == 0:
                 # Notify waiting writers
+                logger.debug(f"[LOCK_MGR] No more readers on '{resource}', notifying waiters")
                 self._condition[resource].notify_all()
 
     async def acquire_write(self, resource: str) -> None:
         """Acquire a write lock on a resource (exclusive)."""
+        logger.debug(f"[LOCK_MGR] Requesting WRITE lock on '{resource}'")
+
         if resource not in self._condition:
+            logger.debug(f"[LOCK_MGR] Initializing lock structures for '{resource}'")
             self._condition[resource] = asyncio.Condition()
             self._reader_counts[resource] = 0
             self._writer_active[resource] = False
 
         async with self._condition[resource]:
             # Wait while any readers or writers are active
+            if self._reader_counts[resource] > 0 or self._writer_active[resource]:
+                logger.debug(
+                    f"[LOCK_MGR] Waiting for lock on '{resource}' - "
+                    f"readers={self._reader_counts[resource]}, writer_active={self._writer_active[resource]}"
+                )
             while self._reader_counts[resource] > 0 or self._writer_active[resource]:
                 await self._condition[resource].wait()
 
             self._writer_active[resource] = True
+            logger.debug(f"[LOCK_MGR] Acquired WRITE lock on '{resource}'")
 
     async def release_write(self, resource: str) -> None:
         """Release a write lock on a resource."""
+        logger.debug(f"[LOCK_MGR] Releasing WRITE lock on '{resource}'")
         async with self._condition[resource]:
             self._writer_active[resource] = False
+            logger.debug(f"[LOCK_MGR] Released WRITE lock on '{resource}', notifying waiters")
             # Notify all waiting readers and writers
             self._condition[resource].notify_all()
 
@@ -267,6 +287,8 @@ class Executor:
             step: The step to execute
             plan: The execution plan (for context)
         """
+        logger.info(f"[EXEC] Starting execution of step {step.step_id} (tool: {step.tool.name})")
+
         result = self._results[step.step_id]
         result.status = StepStatus.RUNNING
         result.start_time = time.time()
@@ -274,8 +296,11 @@ class Executor:
         tool = step.tool
         max_attempts = self.max_retries + 1 if tool.idempotent else 1
 
+        logger.debug(f"[EXEC] Step {step.step_id} will attempt up to {max_attempts} times")
+
         for attempt in range(1, max_attempts + 1):
             result.attempts = attempt
+            logger.debug(f"[EXEC] Step {step.step_id} attempt {attempt}/{max_attempts}")
 
             try:
                 # Acquire resource locks
@@ -351,10 +376,15 @@ class Executor:
         # Prepare arguments (resolve from artifacts)
         args = self._resolve_arguments(step)
 
+        # Log tool execution mode
+        logger.info(f"Executing tool {tool.name}: is_async={tool.is_async}, timeout={timeout}s")
+
         # Execute the tool (async or sync)
         if tool.is_async:
+            logger.debug(f"Tool {tool.name} using async execution path")
             coro = tool.func(**args)
         else:
+            logger.debug(f"Tool {tool.name} using ThreadPoolExecutor (SYNC) path")
             # Wrap sync function in executor
             loop = asyncio.get_event_loop()
             coro = loop.run_in_executor(None, lambda: tool.func(**args))
@@ -387,23 +417,42 @@ class Executor:
 
     async def _acquire_step_locks(self, step: PlanStep) -> None:
         """Acquire all necessary resource locks for a step."""
+        logger.info(
+            f"[LOCK] Step {step.step_id} attempting to acquire locks - "
+            f"reads={list(step.tool.resources.reads)}, writes={list(step.tool.resources.writes)}"
+        )
+
         # Acquire read locks
         for resource in step.tool.resources.reads:
+            logger.debug(f"[LOCK] Acquiring READ lock on resource: {resource}")
             await self._resource_locks.acquire_read(resource)
+            logger.debug(f"[LOCK] Acquired READ lock on resource: {resource}")
 
         # Acquire write locks
         for resource in step.tool.resources.writes:
+            logger.debug(f"[LOCK] Acquiring WRITE lock on resource: {resource}")
             await self._resource_locks.acquire_write(resource)
+            logger.debug(f"[LOCK] Acquired WRITE lock on resource: {resource}")
+
+        logger.info(f"[LOCK] Step {step.step_id} successfully acquired all locks")
 
     async def _release_step_locks(self, step: PlanStep) -> None:
         """Release all resource locks for a step."""
+        logger.info(f"[LOCK] Step {step.step_id} releasing locks")
+
         # Release read locks
         for resource in step.tool.resources.reads:
+            logger.debug(f"[LOCK] Releasing READ lock on resource: {resource}")
             await self._resource_locks.release_read(resource)
+            logger.debug(f"[LOCK] Released READ lock on resource: {resource}")
 
         # Release write locks
         for resource in step.tool.resources.writes:
+            logger.debug(f"[LOCK] Releasing WRITE lock on resource: {resource}")
             await self._resource_locks.release_write(resource)
+            logger.debug(f"[LOCK] Released WRITE lock on resource: {resource}")
+
+        logger.info(f"[LOCK] Step {step.step_id} released all locks")
 
     def _trace_step(
         self,
