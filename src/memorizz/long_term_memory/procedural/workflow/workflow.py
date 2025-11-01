@@ -25,10 +25,11 @@ class Workflow:
         memory_id: str = None,
         outcome: WorkflowOutcome = None,
         user_query: str = None,
+        user_query_examples: List[str] = None,
     ):
         """
         Initialize a new Workflow instance.
-        
+
         Parameters:
         -----------
         name : str
@@ -49,6 +50,8 @@ class Workflow:
             The outcome of the workflow (SUCCESS/FAILURE).
         user_query : str
             The original user query that triggered this workflow.
+        user_query_examples : List[str]
+            List of example queries that should trigger this workflow.
         """
         self.name = name
         self.description = description
@@ -60,23 +63,55 @@ class Workflow:
         self.memory_id = memory_id or str(ObjectId())
         self.outcome = outcome or WorkflowOutcome.SUCCESS
         self.user_query = user_query
-        
+        self.user_query_examples = user_query_examples or []
+
         # Generate the embedding based on the workflow's attributes
         self.embedding = self._generate_embedding()
 
     def _generate_embedding(self):
         """
-        Generate an embedding vector for the workflow based on its attributes.
-        
+        Generate an embedding vector for the workflow based on user query examples.
+
         Returns:
         --------
         list or numpy.array: The embedding vector representing the workflow.
         """
-        # Convert steps to string representation
-        steps_str = str(self.steps)
-        
-        embedding_input = f"{self.name} {self.description} {steps_str} {self.outcome.value} {self.user_query or ''}"
+        # Extract user_query_examples from steps for intent-focused embedding
+        user_query_examples = self._extract_user_query_examples()
+
+        if user_query_examples:
+            # Use only user query examples for embedding - this focuses on user intent
+            embedding_input = " ".join(user_query_examples)
+        else:
+            # Fallback to original approach if no examples found
+            steps_str = str(self.steps)
+            embedding_input = f"{self.name} {self.description} {steps_str} {self.outcome.value} {self.user_query or ''}"
+
         return get_embedding(embedding_input)
+
+    def _extract_user_query_examples(self) -> List[str]:
+        """
+        Extract user query examples from the workflow.
+
+        Returns:
+        --------
+        List[str]
+            List of user query examples, empty list if none found.
+        """
+        examples = []
+
+        # First, check the instance variable (most reliable source)
+        if hasattr(self, 'user_query_examples') and isinstance(self.user_query_examples, list):
+            examples.extend(self.user_query_examples)
+
+        # Also look for user_query_examples in the steps data (for backward compatibility)
+        for step_name, step_data in self.steps.items():
+            if isinstance(step_data, dict) and "user_query_examples" in step_data:
+                step_examples = step_data["user_query_examples"]
+                if isinstance(step_examples, list):
+                    examples.extend(step_examples)
+
+        return examples
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -97,7 +132,8 @@ class Workflow:
             "memory_id": self.memory_id,
             "outcome": self.outcome.value,
             "embedding": self.embedding,
-            "user_query": self.user_query
+            "user_query": self.user_query,
+            "user_query_examples": self.user_query_examples
         }
 
     @classmethod
@@ -124,7 +160,8 @@ class Workflow:
             updated_at=datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else None,
             memory_id=data.get("memory_id"),
             outcome=WorkflowOutcome(data.get("outcome", WorkflowOutcome.SUCCESS.value)),
-            user_query=data.get("user_query")
+            user_query=data.get("user_query"),
+            user_query_examples=data.get("user_query_examples", [])
         )
 
     def store_workflow(self, provider: MemoryProvider) -> str:
